@@ -1,0 +1,29 @@
+DATA: 2026-03-24 13:50:50.927493 | SERIAL: 7891766068976 | ERRO_DB: ERRO:  valor de entrada é inválido para enum tipo_teste: "estanqueidade"
+LINE 4:                 VALUES ('7891766068976', 'estanqueidade', 'J...
+                                                 ^
+ | RESPOSTA_API: {'error': 'INVALID_AUTHORIZATION', 'date_server': 1774374650673}
+DATA: 2026-03-24 13:58:46.573685 | SERIAL: 7891766068976 | ERRO_DB: ERRO:  valor de entrada é inválido para enum tipo_teste: "estanqueidade"
+LINE 4:                 VALUES ('7891766068976', 'estanqueidade', 'J...
+                                                 ^
+ | RESPOSTA_API: {'error': 'INVALID_AUTHORIZATION', 'date_server': 1774375126397}
+DATA: 2026-03-24 14:01:36.128111 | SERIAL: 7891766068976 | ERRO_DB: ERRO:  valor de entrada é inválido para enum tipo_teste: "estanqueidade"
+LINE 4:                 VALUES ('7891766068976', 'estanqueidade', 'J...
+                                                 ^
+ | RESPOSTA_API: {'error': 'INVALID_AUTHORIZATION', 'date_server': 1774375295937}
+DATA: 2026-03-24 14:02:03.368756 | SERIAL: 7891766068976 | ERRO_DB: ERRO:  valor de entrada é inválido para enum tipo_teste: "estanqueidade"
+LINE 4:                 VALUES ('7891766068976', 'estanqueidade', 'J...
+                                                 ^
+ | RESPOSTA_API: {'error': 'INVALID_AUTHORIZATION', 'date_server': 1774375323170}
+DATA: 2026-03-24 14:06:59.495465 | SERIAL: 7891766068976 | ERRO_DB: ERRO:  valor de entrada é inválido para enum tipo_teste: "estanqueidade"
+LINE 4:                 VALUES ('7891766068976', 'estanqueidade', 'J...
+                                                 ^
+ | RESPOSTA_API: {'error': 'INVALID_AUTHORIZATION', 'date_server': 1774375619317}
+DATA: 2026-03-24 14:08:34.486981 | SERIAL: 7891766068976 | ERRO_DB: ERRO:  valor de entrada é inválido para enum tipo_teste: "estanquea"
+LINE 4:                 VALUES ('7891766068976', 'estanquea', 'JIGA_...
+                                                 ^
+ | RESPOSTA_API: {'error': 'INVALID_AUTHORIZATION', 'date_server': 1774375714311}
+DATA: 2026-03-25 08:01:21.876555 | SERIAL: 7891766068976 | ERRO_DB: connection to server at "localhost" (::1), port 5433 failed: Connection refused (0x0000274D/10061)
+	Is the server running on that host and accepting TCP/IP connections?
+connection to server at "localhost" (127.0.0.1), port 5433 failed: Connection refused (0x0000274D/10061)
+	Is the server running on that host and accepting TCP/IP connections?
+ | RESPOSTA_API: {'error': 'INVALID_AUTHORIZATION', 'date_server': 1774440077030}
