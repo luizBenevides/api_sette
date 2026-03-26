@@ -27,3 +27,9 @@ DATA: 2026-03-25 08:01:21.876555 | SERIAL: 7891766068976 | ERRO_DB: connection t
 connection to server at "localhost" (127.0.0.1), port 5433 failed: Connection refused (0x0000274D/10061)
 	Is the server running on that host and accepting TCP/IP connections?
  | RESPOSTA_API: {'error': 'INVALID_AUTHORIZATION', 'date_server': 1774440077030}
+DATA: 2026-03-26 15:17:15.431624 | SERIAL: 7891766068 | ERRO: ERRO:  a nova linha da relação "logs_producao" viola a restrição de verificação "check_serial_numeric"
+DETAIL:  Registro que falhou contém (16, 7891766068, estanque, JIGA_SETTE_01, 30.50, Pa, SETTE_V1, null, R, f, null, {"error": "SERIAL_NOT_FOUND"}, 2026-03-26 15:17:15.388945-04).
+ | RESPOSTA: {'error': 'SERIAL_NOT_FOUND'}
+DATA: 2026-03-26 15:17:36.750157 | SERIAL: 4313110010 | ERRO: ERRO:  a nova linha da relação "logs_producao" viola a restrição de verificação "check_serial_numeric"
+DETAIL:  Registro que falhou contém (17, 4313110010, estanque, JIGA_SETTE_01, 30.50, Pa, SETTE_V1, null, A, t, null, {"total": 1}, 2026-03-26 15:17:36.747362-04).
+ | RESPOSTA: {'total': 1}

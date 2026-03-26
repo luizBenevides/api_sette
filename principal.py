@@ -35,10 +35,12 @@ class OuvinteGlobal(QObject):
         try:
             if hasattr(tecla, 'char') and tecla.char is not None:
                 char = tecla.char
-                if char.isalnum():
+                if char.isdigit():
                     self.buffer += char
                     self.tempos.append(time.time())
                     self.timer_limpeza.start(100) # 100ms de tolerância entre teclas
+                    if len(self.buffer) == 10:
+                        self.validar_rajada()
             
             if tecla == keyboard.Key.enter:
                 self.validar_rajada()
@@ -49,14 +51,14 @@ class OuvinteGlobal(QObject):
         """
         Diferencia humano de máquina pela velocidade média.
         """
-        if len(self.buffer) == 13:
+        if len(self.buffer) == 10 and self.tempos:
             # Calcula o tempo total do primeiro ao último caractere
             tempo_total = self.tempos[-1] - self.tempos[0]
             
-            if tempo_total < 0.5: # Limite de 500ms para 13 dígitos
+            if tempo_total < 0.5: # Limite de 500ms para 10 dígitos
                 self.serial_capturado.emit(self.buffer)
             else:
-                print(f"⚠️ Digitação humana detectada (Tempo: {tempo_total:.2f}s) - Descartando.")
+                print(f" Digitação humana detectada (Tempo: {tempo_total:.2f}s) - Descartando.")
         
         # Limpa tudo para a próxima tentativa
         self.limpar_buffer()
@@ -68,21 +70,22 @@ class OuvinteGlobal(QObject):
 class SegurancaSette:
     @staticmethod
     def validar_serial(serial):
-        """Garante que a leitura local tenha 13 dígitos[cite: 68]."""
-        return bool(re.match(r'^\d{13}$', serial))
+        """Garante que a leitura local tenha 10 dígitos."""
+        return bool(re.match(r'^\d{10}$', serial))
 
     @staticmethod
     def gerar_autenticacao(metodo, nome_funcao):
-        """Geração de HMAC conforme manual SISGEM[cite: 23, 38]."""
+        """Geração de HMAC conforme manual SISGEM."""
         sistema = os.getenv("SPACECOM_SISTEMA", "sette") 
         chave_secreta = os.getenv("SPACECOM_CHAVE_API", "") 
         ruido = os.getenv("SPACECOM_RUIDO", "")
         
-        # Formato de data: mês+hora+dia+minuto+ano em UTC [cite: 42, 43]
+        # Formato de data: mês+hora+dia+minuto+ano em UTC
         agora_utc = datetime.now(timezone.utc)
         data_str = agora_utc.strftime("%m%H%d%M%Y")
         
-        mensagem = f"{sistema.lower()}{data_str}{metodo.upper()}{ruido}{nome_funcao}"
+        # Spacecom valida o método em minúsculo na string assinada.
+        mensagem = f"{sistema.lower()}{data_str}{metodo.lower()}{ruido}{nome_funcao}"
         
         assinatura = hmac.new(
             chave_secreta.encode('utf-8'),
@@ -135,7 +138,7 @@ class ClienteApiSpacecom:
         self.url_base = os.getenv("URL_BASE_SPACECOM")
 
     def enviar_estanqueidade(self, serial_completo):
-        """Envia dados de estanqueidade para a API externa[cite: 59]."""
+        """Envia dados de estanqueidade para a API externa."""
         endpoint = "/watertightness/log"
         auth = SegurancaSette.gerar_autenticacao("POST", "log")
         
@@ -199,7 +202,7 @@ class InterfaceApp(QMainWindow):
             self.log_terminal(f"Serial Lido: {serial}")
             self.processar_envio(serial)
         else:
-            self.log_terminal(f"Leitura ignorada (fora do padrão 13): {serial}")
+            self.log_terminal(f"Leitura ignorada (fora do padrão 10): {serial}")
 
     def processar_envio(self, serial):
         self.label_status.setText(" ENVIANDO DADOS...")
