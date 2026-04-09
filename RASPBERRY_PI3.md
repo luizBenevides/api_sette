@@ -63,7 +63,7 @@ Se usuario ou banco ja existirem, pule esta etapa.
 ### 3.3) Rodar seu script SQL de estrutura
 
 entre no banco: 
-    0 - sudo -u postgres psql -d log_sette
+    0 - sudo -u postgres psql -d log_sette -p 5433
 rode essas queries 1 por 1 na ordem:
     1 - CREATE TYPE tipo_teste AS ENUM ('estanque', 'laser');
     2 - CREATE TYPE status_resultado AS ENUM ('A', 'R');
@@ -85,6 +85,12 @@ rode essas queries 1 por 1 na ordem:
         );
     4 - CREATE INDEX idx_logs_serial ON logs_producao(serial);
     5 - CREATE INDEX idx_logs_data ON logs_producao(criado_em);
+    6 - GRANT USAGE ON SCHEMA public TO sette_app;
+    7 - GRANT INSERT, SELECT, UPDATE ON TABLE public.logs_producao TO sette_app;
+    8 - GRANT USAGE, SELECT ON SEQUENCE public.logs_producao_id_seq TO sette_app;
+    9 - ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT INSERT, SELECT, UPDATE ON TABLES TO sette_app;
+    10 - ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO sette_app;
+
 
 
 ### 3.4) Validar se a tabela esperada existe
@@ -92,6 +98,11 @@ rode essas queries 1 por 1 na ordem:
 ```bash
 sudo -u postgres psql -d log_sette -c "\dt"
 sudo -u postgres psql -d log_sette -c "SELECT COUNT(*) FROM logs_producao;"
+-- Ver quais clusters Postgres existem e em qual porta estão
+sudo pg_lsclusters
+sudo -u postgres psql -d log_sette -p 5433 -c "GRANT USAGE, SELECT ON SEQUENCE public.logs_producao_id_seq TO sette_app;"
+PGPASSWORD='setteapp7771' psql -h localhost -p 5433 -U sette_app -d log_sette -c "insert into logs_producao (serial, test_type, jiga_name, resultado) values ('1234567890','estanque','TESTE','A');"
+
 ```
 
 ## 4) Configurar e instalar o software
@@ -133,7 +144,7 @@ DB_URL=postgresql://sette_app:troque_senha_forte@localhost:5432/log_sette
 ARQUIVO_EMERGENCIA=logs_emergencia.txt
 
 INPUT_MODE=hid
-HID_DEVICE=/dev/input/eventX
+HID_DEVICE=/dev/input/by-id/usb-USBKey_Chip_USBKey_Module_202730041341-event-kbd(exemplo)
 
 # Opcional, so se usar leitor serial de porta tty:
 # INPUT_MODE=serial
@@ -185,6 +196,7 @@ Permissao para ler input HID (usuario delta):
 
 ```bash
 sudo usermod -aG input delta
+sudo usermod -aG input $USER
 ```
 
 Permissao de porta serial (somente se usar tty):
