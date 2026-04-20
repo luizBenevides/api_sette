@@ -63,9 +63,31 @@ class ParserG3i:
             return None
 
         partes = [parte.strip() for parte in linha.split(",")]
-        if len(partes) >= 3 and partes[0].upper() == "N":
-            programa = partes[2].strip().rstrip(";")
-            return programa or None
+        if len(partes) >= 6 and partes[0].upper().startswith("ETT"):
+            tipo_frame = partes[3].upper()
+            if tipo_frame in ("N", "J"):
+                programa = partes[5].strip().rstrip(";")
+                return {
+                    "tipo_frame": tipo_frame,
+                    "programa_teste": programa or None,
+                    "raw": linha_bruta.strip(),
+                }
+
+        return None
+
+    @staticmethod
+    def extrair_fim_teste(linha_bruta):
+        linha = ParserG3i.limpar_linha(linha_bruta)
+        if not linha or ParserG3i.eh_pacote_ignorado(linha):
+            return None
+
+        partes = [parte.strip() for parte in linha.split(",")]
+        if len(partes) >= 4 and partes[0].upper().startswith("ETT") and partes[3].upper() == "XIR":
+            return {
+                "tipo_frame": "XIR",
+                "serial_origem": partes[0],
+                "raw": linha_bruta.strip(),
+            }
 
         return None
 
@@ -163,15 +185,23 @@ class ClienteApiSpacecom:
         endpoint = "/watertightness/log"
         auth = SegurancaSette.gerar_autenticacao("POST", "log")
 
-        valor_mock = "30.5"
-        unidade_mock = "Pa"
-        prog_mock = "SETTE_V1"
-
         dados_teste = dados_teste or {}
-        valor_enviado = dados_teste.get("valor_estanqueidade", valor_mock)
-        unidade_enviada = dados_teste.get("unidade_medida", unidade_mock)
-        programa_enviado = dados_teste.get("programa_teste", prog_mock)
-        status_enviado = dados_teste.get("status", "A")
+        valor_enviado = dados_teste.get("valor_estanqueidade")
+        unidade_enviada = dados_teste.get("unidade_medida")
+        programa_enviado = dados_teste.get("programa_teste")
+        status_enviado = dados_teste.get("status")
+
+        campos_obrigatorios = {
+            "valor_estanqueidade": valor_enviado,
+            "unidade_medida": unidade_enviada,
+            "programa_teste": programa_enviado,
+            "status": status_enviado,
+        }
+        faltando = [chave for chave, valor in campos_obrigatorios.items() if valor in (None, "")]
+        if faltando:
+            return {
+                "erro": f"Dados insuficientes para envio: {', '.join(faltando)}"
+            }, False, valor_enviado, unidade_enviada, programa_enviado
 
         payload = {
             "serial": serial_completo[-10:],
@@ -185,6 +215,13 @@ class ClienteApiSpacecom:
             },
         }
 
+        print(
+            "[API] Preparando envio: "
+            f"serial={payload['serial']} status={status_enviado} "
+            f"value={valor_enviado} unit={unidade_enviada} program={programa_enviado}"
+        )
+        print(f"[API] Payload: {json.dumps(payload, ensure_ascii=False)}")
+
         try:
             res = requests.post(
                 f"{self.url_base}{endpoint}",
@@ -192,8 +229,16 @@ class ClienteApiSpacecom:
                 headers={"Authorization": auth},
                 timeout=10,
             )
-            return res.json(), res.status_code == 200, valor_enviado, unidade_enviada, programa_enviado
+            try:
+                corpo = res.json()
+            except Exception:
+                corpo = {"raw": res.text}
+
+            print(f"[API] HTTP {res.status_code}")
+            print(f"[API] Resposta: {json.dumps(corpo, ensure_ascii=False)}")
+            return corpo, res.status_code == 200, valor_enviado, unidade_enviada, programa_enviado
         except Exception as erro_api:
+            print(f"[API] Erro no envio: {erro_api}")
             return {"erro": str(erro_api)}, False, valor_enviado, unidade_enviada, programa_enviado
 
 
@@ -399,6 +444,7 @@ def criar_leitores_duplos():
 
 
 def processar_serial(serial_lido, api, persistencia, dados_teste=None):
+    print(f"[FLOW] Montando envio para serial do produto: {serial_lido}")
     resposta, sucesso, v_est, v_uni, v_prog = api.enviar_estanqueidade(serial_lido, dados_teste)
 
     dados_log = {
@@ -419,18 +465,79 @@ def processar_serial(serial_lido, api, persistencia, dados_teste=None):
         print(f"[API] Falha no envio para serial {serial_lido}. Resposta: {resposta}")
 
 
+def _dados_teste_do_resultado(resultado, programa_teste):
+    return {
+        "status": resultado["status"],
+        "valor_estanqueidade": resultado["valor_estanqueidade"],
+        "unidade_medida": resultado["unidade_medida"],
+        "programa_teste": programa_teste or "SETTE_V1",
+    }
+
+
+def _tentar_envio(estado, api, persistencia):
+    serial_produto = estado.get("serial_produto")
+    resultado_pendente = estado.get("resultado_pendente")
+    if not serial_produto or not resultado_pendente:
+        print(
+            "[FLOW] Aguardando pareamento: "
+            f"serial={'ok' if serial_produto else 'faltando'} "
+            f"resultado={'ok' if resultado_pendente else 'faltando'}"
+        )
+        return
+
+    dados_teste = _dados_teste_do_resultado(
+        resultado_pendente,
+        estado.get("programa_teste"),
+    )
+    print(
+        "[FLOW] Pareamento completo, enviando: "
+        f"serial={serial_produto} status={dados_teste['status']} "
+        f"value={dados_teste['valor_estanqueidade']} unit={dados_teste['unidade_medida']} "
+        f"program={dados_teste['programa_teste']}"
+    )
+    processar_serial(serial_produto, api, persistencia, dados_teste)
+    estado["serial_produto"] = None
+    estado["resultado_pendente"] = None
+
+
 def processar_linha(linha, api, persistencia, estado):
     linha_limpa = linha.strip()
+    print(f"[RAW] {linha_limpa}")
+
+    fim_teste = ParserG3i.extrair_fim_teste(linha_limpa)
+    if fim_teste:
+        print(f"[G3I] Fim de teste detectado: {fim_teste['raw']}")
+        teste_em_andamento = estado.get("teste_em_andamento")
+        if teste_em_andamento and teste_em_andamento.get("resultado"):
+            estado["resultado_pendente"] = teste_em_andamento["resultado"]
+            _tentar_envio(estado, api, persistencia)
+        else:
+            print("[G3I] XIR recebido sem resultado pronto ainda.")
+        estado["teste_em_andamento"] = None
+        return
 
     programa = ParserG3i.extrair_programa(linha_limpa)
     if programa:
-        estado["programa_teste"] = programa
-        print(f"[G3I] Programa detectado: {programa}")
+        if programa.get("programa_teste"):
+            estado["programa_teste"] = programa["programa_teste"]
+            print(f"[G3I] Programa detectado ({programa['tipo_frame']}): {programa['programa_teste']}")
+
+        if programa["tipo_frame"] == "J":
+            estado["teste_em_andamento"] = {
+                "programa_teste": estado.get("programa_teste"),
+                "resultado": None,
+            }
         return
 
     resultado = ParserG3i.extrair_resultado(linha_limpa)
     if resultado:
-        estado["ultimo_resultado"] = resultado
+        if estado.get("teste_em_andamento") is None:
+            estado["teste_em_andamento"] = {
+                "programa_teste": estado.get("programa_teste"),
+                "resultado": None,
+            }
+
+        estado["teste_em_andamento"]["resultado"] = resultado
         estado["serial_origem_g3i"] = resultado["serial_origem"]
         print(
             "[G3I] Resultado bruto recebido: "
@@ -438,35 +545,14 @@ def processar_linha(linha, api, persistencia, estado):
             f"unidade={resultado['unidade_medida']} raw={resultado['raw']}"
         )
 
-        if estado.get("serial_produto"):
-            dados_teste = {
-                "status": resultado["status"],
-                "valor_estanqueidade": resultado["valor_estanqueidade"],
-                "unidade_medida": resultado["unidade_medida"],
-                "programa_teste": estado.get("programa_teste", "SETTE_V1"),
-            }
-            serial_produto = estado.pop("serial_produto")
-            estado.pop("ultimo_resultado", None)
-            processar_serial(serial_produto, api, persistencia, dados_teste)
-        else:
-            print("[G3I] Resultado aguardando serial do produto para envio.")
+        print("[G3I] Aguardando frame XIR para fechar este ciclo de teste.")
 
         return
 
     if SegurancaSette.validar_serial(linha_limpa):
         estado["serial_produto"] = linha_limpa
         print(f"[BARCODE] Serial capturado: {linha_limpa}")
-
-        if estado.get("ultimo_resultado"):
-            resultado_pendente = estado.pop("ultimo_resultado")
-            dados_teste = {
-                "status": resultado_pendente["status"],
-                "valor_estanqueidade": resultado_pendente["valor_estanqueidade"],
-                "unidade_medida": resultado_pendente["unidade_medida"],
-                "programa_teste": estado.get("programa_teste", "SETTE_V1"),
-            }
-            serial_produto = estado.pop("serial_produto")
-            processar_serial(serial_produto, api, persistencia, dados_teste)
+        _tentar_envio(estado, api, persistencia)
         return
 
     print(f"[RAW] Leitura ignorada: {linha_limpa}")
@@ -487,7 +573,8 @@ def executar_fluxo_duplo(api, persistencia):
     estado = {
         "serial_produto": None,
         "programa_teste": os.getenv("PROGRAMA_TESTE_PADRAO", "SETTE_V1"),
-        "ultimo_resultado": None,
+        "resultado_pendente": None,
+        "teste_em_andamento": None,
         "serial_origem_g3i": None,
     }
 
@@ -535,17 +622,7 @@ def executar_fluxo_duplo(api, persistencia):
                 if SegurancaSette.validar_serial(valor):
                     estado["serial_produto"] = valor
                     print(f"[BARCODE] Serial capturado: {valor}")
-
-                    if estado.get("ultimo_resultado"):
-                        resultado_pendente = estado.pop("ultimo_resultado")
-                        dados_teste = {
-                            "status": resultado_pendente["status"],
-                            "valor_estanqueidade": resultado_pendente["valor_estanqueidade"],
-                            "unidade_medida": resultado_pendente["unidade_medida"],
-                            "programa_teste": estado.get("programa_teste", "SETTE_V1"),
-                        }
-                        serial_produto = estado.pop("serial_produto")
-                        processar_serial(serial_produto, api, persistencia, dados_teste)
+                    _tentar_envio(estado, api, persistencia)
                     continue
 
                 print(f"[BARCODE] Leitura ignorada: {valor}")
@@ -580,7 +657,8 @@ def main():
     estado = {
         "serial_produto": None,
         "programa_teste": os.getenv("PROGRAMA_TESTE_PADRAO", "SETTE_V1"),
-        "ultimo_resultado": None,
+        "resultado_pendente": None,
+        "teste_em_andamento": None,
         "serial_origem_g3i": None,
     }
 
