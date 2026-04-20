@@ -143,7 +143,11 @@ NOME_JIGA=JIGA_SETTE_01
 DB_URL=postgresql://sette_app:troque_senha_forte@localhost:5432/log_sette
 ARQUIVO_EMERGENCIA=logs_emergencia.txt
 
-INPUT_MODE=hid
+INPUT_MODE=dual
+SERIAL_PORT=/dev/serial0
+SERIAL_BAUDRATE=9600
+SERIAL_TIMEOUT=1
+SERIAL_TERMINATOR=;
 HID_DEVICE=/dev/input/by-id/usb-USBKey_Chip_USBKey_Module_202730041341-event-kbd(exemplo)
 
 # Opcional, so se usar leitor serial de porta tty:
@@ -192,6 +196,17 @@ dmesg | tail -n 50
 
 Se necessario, ajuste INPUT_MODE e variaveis correspondentes no .env.
 
+Se a ideia for receber o teste da G3i pela serial e depois ler o serial do produto pelo scanner, use:
+
+```env
+INPUT_MODE=dual
+SERIAL_PORT=/dev/serial0
+SERIAL_BAUDRATE=9600
+SERIAL_TIMEOUT=1
+SERIAL_TERMINATOR=;
+HID_DEVICE=/dev/input/by-id/usb-USBKey_Chip_USBKey_Module_202730041341-event-kbd
+```
+
 Permissao para ler input HID (usuario delta):
 
 ```bash
@@ -217,7 +232,7 @@ python principal_headless.py
 
 Valide:
 
-- Recebe leitura do leitor
+- Recebe leitura da maquina e do leitor
 - Envia para API
 - Grava no banco
 - Em falha, salva em logs_emergencia.txt

@@ -4,6 +4,8 @@ import hashlib
 import os
 import re
 import time
+import threading
+from queue import Queue, Empty
 from datetime import datetime, timezone
 
 import psycopg2
@@ -12,7 +14,7 @@ import serial
 from dotenv import load_dotenv
 
 try:
-    from evdev import InputDevice, ecodes
+    from evdev import InputDevice, ecodes  # pyright: ignore[reportMissingImports]
 except Exception:
     InputDevice = None
     ecodes = None
@@ -42,6 +44,70 @@ class SegurancaSette:
         ).hexdigest()
 
         return f"{sistema}:{assinatura}"
+
+
+class ParserG3i:
+    @staticmethod
+    def limpar_linha(linha_bruta):
+        return linha_bruta.strip().rstrip(";")
+
+    @staticmethod
+    def eh_pacote_ignorado(linha_bruta):
+        linha = linha_bruta.strip().upper()
+        return linha.startswith("XPO") or linha.startswith("XPA")
+
+    @staticmethod
+    def extrair_programa(linha_bruta):
+        linha = ParserG3i.limpar_linha(linha_bruta)
+        if not linha or ParserG3i.eh_pacote_ignorado(linha):
+            return None
+
+        partes = [parte.strip() for parte in linha.split(",")]
+        if len(partes) >= 3 and partes[0].upper() == "N":
+            programa = partes[2].strip().rstrip(";")
+            return programa or None
+
+        return None
+
+    @staticmethod
+    def extrair_resultado(linha_bruta):
+        linha = ParserG3i.limpar_linha(linha_bruta)
+        if not linha or ParserG3i.eh_pacote_ignorado(linha):
+            return None
+
+        partes = [parte.strip() for parte in linha.split(",")]
+        if len(partes) < 8:
+            return None
+
+        if not partes[0].upper().startswith("ETT"):
+            return None
+
+        status = partes[3].upper()
+        if status not in ("A", "R"):
+            return None
+
+        valor_pressao = partes[4]
+        unidade_pressao = partes[5]
+        valor_fuga = partes[6]
+        unidade_fuga = partes[7].rstrip(";")
+
+        valor_estanqueidade = valor_fuga or valor_pressao
+        unidade_medida = unidade_fuga or unidade_pressao
+
+        return {
+            "tipo_frame": "resultado",
+            "serial_origem": partes[0],
+            "data_teste": partes[1],
+            "hora_teste": partes[2],
+            "status": status,
+            "valor_pressao": valor_pressao,
+            "unidade_pressao": unidade_pressao,
+            "valor_estanqueidade": valor_estanqueidade,
+            "unidade_medida": unidade_medida,
+            "valor_fuga": valor_fuga,
+            "unidade_fuga": unidade_fuga,
+            "raw": linha_bruta.strip(),
+        }
 
 
 class GerenciadorPersistencia:
@@ -93,7 +159,7 @@ class ClienteApiSpacecom:
     def __init__(self):
         self.url_base = os.getenv("URL_BASE_SPACECOM", "")
 
-    def enviar_estanqueidade(self, serial_completo):
+    def enviar_estanqueidade(self, serial_completo, dados_teste=None):
         endpoint = "/watertightness/log"
         auth = SegurancaSette.gerar_autenticacao("POST", "log")
 
@@ -101,14 +167,20 @@ class ClienteApiSpacecom:
         unidade_mock = "Pa"
         prog_mock = "SETTE_V1"
 
+        dados_teste = dados_teste or {}
+        valor_enviado = dados_teste.get("valor_estanqueidade", valor_mock)
+        unidade_enviada = dados_teste.get("unidade_medida", unidade_mock)
+        programa_enviado = dados_teste.get("programa_teste", prog_mock)
+        status_enviado = dados_teste.get("status", "A")
+
         payload = {
             "serial": serial_completo[-10:],
             "name_jiga": os.getenv("NOME_JIGA"),
             "info": {
-                "Value": valor_mock,
-                "Status": "A",
-                "Value_unit": unidade_mock,
-                "Test_program": prog_mock,
+                "Value": valor_enviado,
+                "Status": status_enviado,
+                "Value_unit": unidade_enviada,
+                "Test_program": programa_enviado,
                 "Failure_cause": "",
             },
         }
@@ -120,9 +192,9 @@ class ClienteApiSpacecom:
                 headers={"Authorization": auth},
                 timeout=10,
             )
-            return res.json(), res.status_code == 200, valor_mock, unidade_mock, prog_mock
+            return res.json(), res.status_code == 200, valor_enviado, unidade_enviada, programa_enviado
         except Exception as erro_api:
-            return {"erro": str(erro_api)}, False, valor_mock, unidade_mock, prog_mock
+            return {"erro": str(erro_api)}, False, valor_enviado, unidade_enviada, programa_enviado
 
 
 class LeitorSerial:
@@ -130,6 +202,7 @@ class LeitorSerial:
         self.porta = os.getenv("SERIAL_PORT", "/dev/ttyUSB0")
         self.baudrate = int(os.getenv("SERIAL_BAUDRATE", "9600"))
         self.timeout = float(os.getenv("SERIAL_TIMEOUT", "1"))
+        self.terminador = os.getenv("SERIAL_TERMINATOR", ";").encode("utf-8")
         self.conexao = None
 
     def conectar(self):
@@ -151,7 +224,7 @@ class LeitorSerial:
             self.conectar()
 
         try:
-            bruto = self.conexao.readline()
+            bruto = self.conexao.read_until(self.terminador)
             if not bruto:
                 return None
 
@@ -163,11 +236,7 @@ class LeitorSerial:
             if match:
                 return match.group(0)
 
-            if SegurancaSette.validar_serial(texto):
-                return texto
-
-            print(f"[SERIAL] Leitura ignorada: {texto}")
-            return None
+            return texto
 
         except Exception as e:
             print(f"[SERIAL] Erro de leitura: {e}")
@@ -178,6 +247,14 @@ class LeitorSerial:
                     pass
             self.conexao = None
             return None
+
+    def fechar(self):
+        if self.conexao:
+            try:
+                self.conexao.close()
+            except Exception:
+                pass
+            self.conexao = None
 
 
 class LeitorHID:
@@ -274,6 +351,20 @@ class LeitorHID:
             time.sleep(1)
             return None
 
+    def fechar(self):
+        self.dispositivo = None
+
+
+class LeitorHIDScanner:
+    def __init__(self):
+        self.leitor = LeitorHID()
+
+    def ler_serial(self):
+        return self.leitor.ler_serial()
+
+    def fechar(self):
+        self.leitor.fechar()
+
 
 def criar_leitor():
     modo = os.getenv("INPUT_MODE", "auto").strip().lower()
@@ -296,14 +387,25 @@ def criar_leitor():
     return LeitorSerial()
 
 
-def processar_serial(serial_lido, api, persistencia):
-    resposta, sucesso, v_est, v_uni, v_prog = api.enviar_estanqueidade(serial_lido)
+def criar_leitores_duplos():
+    leitor_maquina = LeitorSerial()
+    leitor_scanner = None
+
+    hid_device = os.getenv("HID_DEVICE", "").strip()
+    if hid_device.startswith("/dev/input/"):
+        leitor_scanner = LeitorHIDScanner()
+
+    return leitor_maquina, leitor_scanner
+
+
+def processar_serial(serial_lido, api, persistencia, dados_teste=None):
+    resposta, sucesso, v_est, v_uni, v_prog = api.enviar_estanqueidade(serial_lido, dados_teste)
 
     dados_log = {
         "serial": serial_lido,
         "tipo": "estanque",
         "jiga": os.getenv("NOME_JIGA"),
-        "status": "A" if sucesso else "R",
+        "status": (dados_teste or {}).get("status", "A" if sucesso else "R"),
         "valor_estanqueidade": v_est,
         "unidade_medida": v_uni,
         "programa_teste": v_prog,
@@ -317,20 +419,177 @@ def processar_serial(serial_lido, api, persistencia):
         print(f"[API] Falha no envio para serial {serial_lido}. Resposta: {resposta}")
 
 
+def processar_linha(linha, api, persistencia, estado):
+    linha_limpa = linha.strip()
+
+    programa = ParserG3i.extrair_programa(linha_limpa)
+    if programa:
+        estado["programa_teste"] = programa
+        print(f"[G3I] Programa detectado: {programa}")
+        return
+
+    resultado = ParserG3i.extrair_resultado(linha_limpa)
+    if resultado:
+        estado["ultimo_resultado"] = resultado
+        estado["serial_origem_g3i"] = resultado["serial_origem"]
+        print(
+            "[G3I] Resultado bruto recebido: "
+            f"status={resultado['status']} valor={resultado['valor_estanqueidade']} "
+            f"unidade={resultado['unidade_medida']} raw={resultado['raw']}"
+        )
+
+        if estado.get("serial_produto"):
+            dados_teste = {
+                "status": resultado["status"],
+                "valor_estanqueidade": resultado["valor_estanqueidade"],
+                "unidade_medida": resultado["unidade_medida"],
+                "programa_teste": estado.get("programa_teste", "SETTE_V1"),
+            }
+            serial_produto = estado.pop("serial_produto")
+            estado.pop("ultimo_resultado", None)
+            processar_serial(serial_produto, api, persistencia, dados_teste)
+        else:
+            print("[G3I] Resultado aguardando serial do produto para envio.")
+
+        return
+
+    if SegurancaSette.validar_serial(linha_limpa):
+        estado["serial_produto"] = linha_limpa
+        print(f"[BARCODE] Serial capturado: {linha_limpa}")
+
+        if estado.get("ultimo_resultado"):
+            resultado_pendente = estado.pop("ultimo_resultado")
+            dados_teste = {
+                "status": resultado_pendente["status"],
+                "valor_estanqueidade": resultado_pendente["valor_estanqueidade"],
+                "unidade_medida": resultado_pendente["unidade_medida"],
+                "programa_teste": estado.get("programa_teste", "SETTE_V1"),
+            }
+            serial_produto = estado.pop("serial_produto")
+            processar_serial(serial_produto, api, persistencia, dados_teste)
+        return
+
+    print(f"[RAW] Leitura ignorada: {linha_limpa}")
+
+
+def _worker_leitor(nome_fonte, leitor, fila_eventos, parar_evento):
+    while not parar_evento.is_set():
+        try:
+            valor = leitor.ler_serial()
+            if valor:
+                fila_eventos.put((nome_fonte, valor))
+        except Exception as erro:
+            fila_eventos.put(("erro", f"[{nome_fonte}] {erro}"))
+            time.sleep(1)
+
+
+def executar_fluxo_duplo(api, persistencia):
+    estado = {
+        "serial_produto": None,
+        "programa_teste": os.getenv("PROGRAMA_TESTE_PADRAO", "SETTE_V1"),
+        "ultimo_resultado": None,
+        "serial_origem_g3i": None,
+    }
+
+    leitor_maquina, leitor_scanner = criar_leitores_duplos()
+    fila_eventos = Queue()
+    parar_evento = threading.Event()
+    threads = []
+
+    threads.append(
+        threading.Thread(
+            target=_worker_leitor,
+            args=("maquina", leitor_maquina, fila_eventos, parar_evento),
+            daemon=True,
+        )
+    )
+
+    if leitor_scanner is not None:
+        threads.append(
+            threading.Thread(
+                target=_worker_leitor,
+                args=("scanner", leitor_scanner, fila_eventos, parar_evento),
+                daemon=True,
+            )
+        )
+
+    for thread in threads:
+        thread.start()
+
+    try:
+        while True:
+            try:
+                origem, valor = fila_eventos.get(timeout=0.5)
+            except Empty:
+                continue
+
+            if origem == "erro":
+                print(valor)
+                continue
+
+            if origem == "maquina":
+                processar_linha(valor, api, persistencia, estado)
+                continue
+
+            if origem == "scanner":
+                if SegurancaSette.validar_serial(valor):
+                    estado["serial_produto"] = valor
+                    print(f"[BARCODE] Serial capturado: {valor}")
+
+                    if estado.get("ultimo_resultado"):
+                        resultado_pendente = estado.pop("ultimo_resultado")
+                        dados_teste = {
+                            "status": resultado_pendente["status"],
+                            "valor_estanqueidade": resultado_pendente["valor_estanqueidade"],
+                            "unidade_medida": resultado_pendente["unidade_medida"],
+                            "programa_teste": estado.get("programa_teste", "SETTE_V1"),
+                        }
+                        serial_produto = estado.pop("serial_produto")
+                        processar_serial(serial_produto, api, persistencia, dados_teste)
+                    continue
+
+                print(f"[BARCODE] Leitura ignorada: {valor}")
+    except KeyboardInterrupt:
+        print("[INIT] Encerrando...")
+        parar_evento.set()
+        try:
+            leitor_maquina.fechar()
+        except Exception:
+            pass
+        if leitor_scanner is not None:
+            try:
+                leitor_scanner.fechar()
+            except Exception:
+                pass
+
+
 def main():
     print("[INIT] Iniciando modo headless")
     print("[INIT] Aguardando leituras do leitor...")
 
     api = ClienteApiSpacecom()
     persistencia = GerenciadorPersistencia()
+    modo = os.getenv("INPUT_MODE", "auto").strip().lower()
+
+    if modo == "dual":
+        print("[INIT] INPUT_MODE=dual -> lendo maquina + scanner em paralelo")
+        executar_fluxo_duplo(api, persistencia)
+        return
+
     leitor = criar_leitor()
+    estado = {
+        "serial_produto": None,
+        "programa_teste": os.getenv("PROGRAMA_TESTE_PADRAO", "SETTE_V1"),
+        "ultimo_resultado": None,
+        "serial_origem_g3i": None,
+    }
 
     while True:
         serial_lido = leitor.ler_serial()
         if not serial_lido:
             continue
 
-        processar_serial(serial_lido, api, persistencia)
+        processar_linha(serial_lido, api, persistencia, estado)
 
 
 if __name__ == "__main__":
