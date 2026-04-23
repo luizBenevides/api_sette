@@ -6,6 +6,9 @@ import hashlib
 import requests
 import psycopg2
 import re
+import threading
+from collections import deque
+from queue import Queue, Empty
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
@@ -133,6 +136,25 @@ class GerenciadorPersistencia:
         with open(self.arquivo_txt, "a", encoding="utf-8") as f:
             f.write(f"DATA: {datetime.now()} | SERIAL: {dados['serial']} | ERRO: {erro_db} | RESPOSTA: {resposta}\n")
 
+
+class FilaSerialFIFO:
+    def __init__(self):
+        self.itens = deque()
+
+    def enfileirar(self, serial):
+        self.itens.append(serial)
+        print(f"[QUEUE] Serial enfileirado: {serial} | total={len(self.itens)}")
+
+    def desenfileirar(self):
+        if not self.itens:
+            return None
+        serial = self.itens.popleft()
+        print(f"[QUEUE] Serial liberado para envio: {serial} | restante={len(self.itens)}")
+        return serial
+
+    def vazio(self):
+        return not self.itens
+
 class ClienteApiSpacecom:
     def __init__(self):
         self.url_base = os.getenv("URL_BASE_SPACECOM")
@@ -141,28 +163,49 @@ class ClienteApiSpacecom:
         """Envia dados de estanqueidade para a API externa."""
         endpoint = "/watertightness/log"
         auth = SegurancaSette.gerar_autenticacao("POST", "log")
-        
-        valor_mock = "30.5"
-        unidade_mock = "Pa"
-        prog_mock = "SETTE_V1"
+
+        valor_envio = os.getenv("VALOR_ESTANQUEIDADE_PADRAO")
+        unidade_envio = os.getenv("UNIDADE_ESTANQUEIDADE_PADRAO")
+        programa_envio = os.getenv("PROGRAMA_TESTE_PADRAO")
+        status_envio = os.getenv("STATUS_PADRAO", "A")
+
+        if not all([valor_envio, unidade_envio, programa_envio, status_envio]):
+            return {
+                "erro": "Dados de envio incompletos no .env. Configure VALOR_ESTANQUEIDADE_PADRAO, UNIDADE_ESTANQUEIDADE_PADRAO, PROGRAMA_TESTE_PADRAO e STATUS_PADRAO."
+            }, False, valor_envio, unidade_envio, programa_envio
 
         payload = {
-            "serial": serial_completo[-10:], # API externa só aceita 10 dígitos
+            "serial": serial_completo[-10:],
             "name_jiga": os.getenv("NOME_JIGA"),
             "info": {
-                "Value": valor_mock, 
-                "Status": "A", 
-                "Value_unit": unidade_mock, 
-                "Test_program": prog_mock, 
+                "Value": valor_envio,
+                "Status": status_envio,
+                "Value_unit": unidade_envio,
+                "Test_program": programa_envio,
                 "Failure_cause": ""
             }
         }
+
+        print(
+            "[API] Preparando envio: "
+            f"serial={payload['serial']} status={status_envio} "
+            f"value={valor_envio} unit={unidade_envio} program={programa_envio}"
+        )
+        print(f"[API] Payload: {json.dumps(payload, ensure_ascii=False)}")
         
         try:
             res = requests.post(f"{self.url_base}{endpoint}", json=payload, headers={"Authorization": auth}, timeout=10)
-            return res.json(), res.status_code == 200, valor_mock, unidade_mock, prog_mock
+            try:
+                corpo = res.json()
+            except Exception:
+                corpo = {"raw": res.text}
+
+            print(f"[API] HTTP {res.status_code}")
+            print(f"[API] Resposta: {json.dumps(corpo, ensure_ascii=False)}")
+            return corpo, res.status_code == 200, valor_envio, unidade_envio, programa_envio
         except Exception as e:
-            return {"erro": str(e)}, False, valor_mock, unidade_mock, prog_mock
+            print(f"[API] Erro no envio: {e}")
+            return {"erro": str(e)}, False, valor_envio, unidade_envio, programa_envio
 
 # --- INTERFACE GRÁFICA ---
 class InterfaceApp(QMainWindow):
@@ -173,6 +216,11 @@ class InterfaceApp(QMainWindow):
         
         self.api = ClienteApiSpacecom()
         self.dados = GerenciadorPersistencia()
+        self.fila_serial = FilaSerialFIFO()
+        self.processando = False
+        self.fila_eventos = Queue()
+        self.thread_worker = threading.Thread(target=self.processar_fila_worker, daemon=True)
+        self.thread_worker.start()
         
         # Inicializa o ouvinte global
         self.ouvinte = OuvinteGlobal()
@@ -200,15 +248,40 @@ class InterfaceApp(QMainWindow):
         serial = serial_recebido.strip()
         if SegurancaSette.validar_serial(serial):
             self.log_terminal(f"Serial Lido: {serial}")
-            self.processar_envio(serial)
+            self.fila_serial.enfileirar(serial)
+            self.fila_eventos.put("processar")
         else:
             self.log_terminal(f"Leitura ignorada (fora do padrão 10): {serial}")
 
+    def processar_fila_worker(self):
+        while True:
+            evento = self.fila_eventos.get()
+            if evento != "processar":
+                continue
+
+            if self.processando:
+                continue
+
+            self.processando = True
+            try:
+                while not self.fila_serial.vazio():
+                    serial = self.fila_serial.desenfileirar()
+                    if not serial:
+                        break
+                    self.processar_envio(serial)
+            finally:
+                self.processando = False
+
     def processar_envio(self, serial):
         self.label_status.setText(" ENVIANDO DADOS...")
+        self.log_terminal(f"[FLOW] Enviando serial {serial}")
         
-        # Chama API e recebe os valores Mock
         resposta, sucesso, v_est, v_uni, v_prog = self.api.enviar_estanqueidade(serial)
+
+        self.log_terminal(
+            f"[API] retorno={'OK' if sucesso else 'FALHA'} serial={serial} "
+            f"value={v_est} unit={v_uni} program={v_prog}"
+        )
 
         # Prepara o dicionário para gravação no banco
         dados_log = {

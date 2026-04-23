@@ -5,6 +5,7 @@ import os
 import re
 import time
 import threading
+from collections import deque
 from queue import Queue, Empty
 from datetime import datetime, timezone
 
@@ -175,6 +176,72 @@ class GerenciadorPersistencia:
                 f"DATA: {datetime.now()} | SERIAL: {dados['serial']} | "
                 f"ERRO: {erro_db} | RESPOSTA: {resposta}\n"
             )
+
+
+class FilaPareamentoFIFO:
+    def __init__(self, timeout_serial_seg=1800, timeout_resultado_seg=1800):
+        self.serials = deque()
+        self.resultados = deque()
+        self.timeout_serial_seg = timeout_serial_seg
+        self.timeout_resultado_seg = timeout_resultado_seg
+
+    def _agora(self):
+        return time.time()
+
+    def adicionar_serial(self, serial_produto):
+        item = {
+            "serial": serial_produto,
+            "criado_em": self._agora(),
+        }
+        self.serials.append(item)
+        print(
+            f"[QUEUE] Serial enfileirado: {serial_produto} | "
+            f"fila_seriais={len(self.serials)} fila_resultados={len(self.resultados)}"
+        )
+
+    def adicionar_resultado(self, resultado):
+        item = {
+            "resultado": resultado,
+            "criado_em": self._agora(),
+        }
+        self.resultados.append(item)
+        print(
+            f"[QUEUE] Resultado enfileirado: {resultado['raw']} | "
+            f"fila_seriais={len(self.serials)} fila_resultados={len(self.resultados)}"
+        )
+
+    def limpar_expirados(self):
+        agora = self._agora()
+
+        while self.serials and (agora - self.serials[0]["criado_em"]) > self.timeout_serial_seg:
+            expirado = self.serials.popleft()
+            print(f"[QUEUE] Serial expirado sem resultado: {expirado['serial']}")
+
+        while self.resultados and (agora - self.resultados[0]["criado_em"]) > self.timeout_resultado_seg:
+            expirado = self.resultados.popleft()
+            print(f"[QUEUE] Resultado expirado sem serial: {expirado['resultado']['raw']}")
+
+    def pode_parear(self):
+        self.limpar_expirados()
+        return bool(self.serials) and bool(self.resultados)
+
+    def consumir_pareamento(self):
+        self.limpar_expirados()
+        if not self.serials or not self.resultados:
+            return None
+
+        serial_item = self.serials.popleft()
+        resultado_item = self.resultados.popleft()
+
+        print(
+            f"[QUEUE] Pareando FIFO: serial={serial_item['serial']} "
+            f"<-> resultado={resultado_item['resultado']['raw']}"
+        )
+
+        return serial_item["serial"], resultado_item["resultado"]
+
+    def estado_resumido(self):
+        return f"seriais={len(self.serials)} resultados={len(self.resultados)}"
 
 
 class ClienteApiSpacecom:
@@ -474,33 +541,29 @@ def _dados_teste_do_resultado(resultado, programa_teste):
     }
 
 
-def _tentar_envio(estado, api, persistencia):
-    serial_produto = estado.get("serial_produto")
-    resultado_pendente = estado.get("resultado_pendente")
-    if not serial_produto or not resultado_pendente:
+def _tentar_pareamentos(fila_pareamento, estado, api, persistencia):
+    while fila_pareamento.pode_parear():
+        pareamento = fila_pareamento.consumir_pareamento()
+        if not pareamento:
+            return
+
+        serial_produto, resultado_pendente = pareamento
+        programa_teste = estado.get("programa_teste")
+        if estado.get("teste_em_andamento") and estado["teste_em_andamento"].get("programa_teste"):
+            programa_teste = estado["teste_em_andamento"]["programa_teste"]
+
+        dados_teste = _dados_teste_do_resultado(resultado_pendente, programa_teste)
+
         print(
-            "[FLOW] Aguardando pareamento: "
-            f"serial={'ok' if serial_produto else 'faltando'} "
-            f"resultado={'ok' if resultado_pendente else 'faltando'}"
+            "[FLOW] Pareamento FIFO pronto, enviando: "
+            f"serial={serial_produto} status={dados_teste['status']} "
+            f"value={dados_teste['valor_estanqueidade']} unit={dados_teste['unidade_medida']} "
+            f"program={dados_teste['programa_teste']}"
         )
-        return
-
-    dados_teste = _dados_teste_do_resultado(
-        resultado_pendente,
-        estado.get("programa_teste"),
-    )
-    print(
-        "[FLOW] Pareamento completo, enviando: "
-        f"serial={serial_produto} status={dados_teste['status']} "
-        f"value={dados_teste['valor_estanqueidade']} unit={dados_teste['unidade_medida']} "
-        f"program={dados_teste['programa_teste']}"
-    )
-    processar_serial(serial_produto, api, persistencia, dados_teste)
-    estado["serial_produto"] = None
-    estado["resultado_pendente"] = None
+        processar_serial(serial_produto, api, persistencia, dados_teste)
 
 
-def processar_linha(linha, api, persistencia, estado):
+def processar_linha(linha, api, persistencia, estado, fila_pareamento):
     linha_limpa = linha.strip()
     print(f"[RAW] {linha_limpa}")
 
@@ -509,8 +572,8 @@ def processar_linha(linha, api, persistencia, estado):
         print(f"[G3I] Fim de teste detectado: {fim_teste['raw']}")
         teste_em_andamento = estado.get("teste_em_andamento")
         if teste_em_andamento and teste_em_andamento.get("resultado"):
-            estado["resultado_pendente"] = teste_em_andamento["resultado"]
-            _tentar_envio(estado, api, persistencia)
+            fila_pareamento.adicionar_resultado(teste_em_andamento["resultado"])
+            _tentar_pareamentos(fila_pareamento, estado, api, persistencia)
         else:
             print("[G3I] XIR recebido sem resultado pronto ainda.")
         estado["teste_em_andamento"] = None
@@ -550,9 +613,9 @@ def processar_linha(linha, api, persistencia, estado):
         return
 
     if SegurancaSette.validar_serial(linha_limpa):
-        estado["serial_produto"] = linha_limpa
+        fila_pareamento.adicionar_serial(linha_limpa)
         print(f"[BARCODE] Serial capturado: {linha_limpa}")
-        _tentar_envio(estado, api, persistencia)
+        _tentar_pareamentos(fila_pareamento, estado, api, persistencia)
         return
 
     print(f"[RAW] Leitura ignorada: {linha_limpa}")
@@ -571,12 +634,14 @@ def _worker_leitor(nome_fonte, leitor, fila_eventos, parar_evento):
 
 def executar_fluxo_duplo(api, persistencia):
     estado = {
-        "serial_produto": None,
         "programa_teste": os.getenv("PROGRAMA_TESTE_PADRAO", "SETTE_V1"),
-        "resultado_pendente": None,
         "teste_em_andamento": None,
         "serial_origem_g3i": None,
     }
+    fila_pareamento = FilaPareamentoFIFO(
+        timeout_serial_seg=int(os.getenv("FIFO_TIMEOUT_SERIAL_SEG", "1800")),
+        timeout_resultado_seg=int(os.getenv("FIFO_TIMEOUT_RESULTADO_SEG", "1800")),
+    )
 
     leitor_maquina, leitor_scanner = criar_leitores_duplos()
     fila_eventos = Queue()
@@ -615,14 +680,14 @@ def executar_fluxo_duplo(api, persistencia):
                 continue
 
             if origem == "maquina":
-                processar_linha(valor, api, persistencia, estado)
+                processar_linha(valor, api, persistencia, estado, fila_pareamento)
                 continue
 
             if origem == "scanner":
                 if SegurancaSette.validar_serial(valor):
-                    estado["serial_produto"] = valor
+                    fila_pareamento.adicionar_serial(valor)
                     print(f"[BARCODE] Serial capturado: {valor}")
-                    _tentar_envio(estado, api, persistencia)
+                    _tentar_pareamentos(fila_pareamento, estado, api, persistencia)
                     continue
 
                 print(f"[BARCODE] Leitura ignorada: {valor}")
@@ -655,19 +720,21 @@ def main():
 
     leitor = criar_leitor()
     estado = {
-        "serial_produto": None,
         "programa_teste": os.getenv("PROGRAMA_TESTE_PADRAO", "SETTE_V1"),
-        "resultado_pendente": None,
         "teste_em_andamento": None,
         "serial_origem_g3i": None,
     }
+    fila_pareamento = FilaPareamentoFIFO(
+        timeout_serial_seg=int(os.getenv("FIFO_TIMEOUT_SERIAL_SEG", "1800")),
+        timeout_resultado_seg=int(os.getenv("FIFO_TIMEOUT_RESULTADO_SEG", "1800")),
+    )
 
     while True:
         serial_lido = leitor.ler_serial()
         if not serial_lido:
             continue
 
-        processar_linha(serial_lido, api, persistencia, estado)
+        processar_linha(serial_lido, api, persistencia, estado, fila_pareamento)
 
 
 if __name__ == "__main__":
