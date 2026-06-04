@@ -653,6 +653,11 @@ def processar_linha(linha, api, persistencia, estado, fila_pareamento):
         avaliador_casos = estado.get("avaliador_casos")
         memoria_alvo = estado.get("auto_memoria_memoria_alvo")
 
+        # Sempre tenta limpar memoria pendente para liberar a maquina
+        # antes de avaliar se a serial atual cai em um novo caso.
+        if auto_memoria:
+            auto_memoria.processar_serial(linha_limpa, controlador_clp, print, memoria_alvo=None)
+
         if memoria_alvo is None and avaliador_casos:
             memoria_alvo, motivo = avaliador_casos.avaliar(linha_limpa)
             if memoria_alvo:

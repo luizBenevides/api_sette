@@ -379,6 +379,16 @@ class InterfaceApp(QMainWindow):
         serial = serial_recebido.strip()
         if SegurancaSette.validar_serial(serial):
             self.log_terminal(f"Serial Lido: {serial}")
+
+            # Sempre tenta resetar memoria pendente para liberar a maquina
+            # antes de avaliar novo caso para a serial atual.
+            self.ciclo_auto_memoria.processar_serial(
+                serial,
+                self.controlador_clp,
+                self.log_terminal,
+                memoria_alvo=None,
+            )
+
             memoria_alvo, motivo = self.avaliador_casos.avaliar(serial)
             if memoria_alvo:
                 self.log_terminal(f"[VALIDACAO] Serial {serial} caiu no caso {motivo} -> {memoria_alvo}")
