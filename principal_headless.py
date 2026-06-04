@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from core.memoria import obter_memoria_operacional
 from core.clp import ControladorCLP
 from core.auto_memoria import CicloAutomaticoMemorias
+from core.validacoes_memoria import AvaliadorCasosMemoria
 
 try:
     from evdev import InputDevice, ecodes  # pyright: ignore[reportMissingImports]
@@ -619,15 +620,34 @@ def processar_linha(linha, api, persistencia, estado, fila_pareamento):
     if SegurancaSette.validar_serial(linha_limpa):
         auto_memoria = estado.get("auto_memoria")
         controlador_clp = estado.get("controlador_clp")
+        avaliador_casos = estado.get("avaliador_casos")
         memoria_alvo = estado.get("auto_memoria_memoria_alvo")
+
+        if memoria_alvo is None and avaliador_casos:
+            memoria_alvo, motivo = avaliador_casos.avaliar(linha_limpa)
+            if memoria_alvo:
+                estado["auto_memoria_memoria_alvo"] = memoria_alvo
+                print(f"[VALIDACAO] Serial {linha_limpa} caiu no caso {motivo} -> {memoria_alvo}")
+
         if auto_memoria and memoria_alvo:
             auto_memoria.processar_serial(linha_limpa, controlador_clp, print, memoria_alvo=memoria_alvo)
             estado["auto_memoria_memoria_alvo"] = None
+            print(f"[VALIDACAO] Fluxo bloqueado para serial {linha_limpa} por caso de memoria")
+            return
 
         fila_pareamento.adicionar_serial(linha_limpa)
         print(f"[BARCODE] Serial capturado: {linha_limpa}")
         _tentar_pareamentos(fila_pareamento, estado, api, persistencia)
         return
+
+    if linha_limpa.isdigit():
+        auto_memoria = estado.get("auto_memoria")
+        controlador_clp = estado.get("controlador_clp")
+        if auto_memoria:
+            print(f"[VALIDACAO] Serial invalida {linha_limpa} -> M130")
+            auto_memoria.processar_serial(linha_limpa, controlador_clp, print, memoria_alvo="M130")
+            print(f"[VALIDACAO] Fluxo bloqueado para serial invalida {linha_limpa}")
+            return
 
     print(f"[RAW] Leitura ignorada: {linha_limpa}")
 
@@ -653,6 +673,7 @@ def executar_fluxo_duplo(api, persistencia):
         "memoria_operacional": obter_memoria_operacional(),
         "auto_memoria": CicloAutomaticoMemorias(),
         "auto_memoria_memoria_alvo": None,
+        "avaliador_casos": AvaliadorCasosMemoria(),
         "controlador_clp": controlador_clp,
     }
     fila_pareamento = FilaPareamentoFIFO(
@@ -748,6 +769,7 @@ def main():
         "memoria_operacional": obter_memoria_operacional(),
         "auto_memoria": CicloAutomaticoMemorias(),
         "auto_memoria_memoria_alvo": None,
+        "avaliador_casos": AvaliadorCasosMemoria(),
         "controlador_clp": controlador_clp,
     }
     fila_pareamento = FilaPareamentoFIFO(

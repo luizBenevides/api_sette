@@ -30,6 +30,7 @@ import time
 from core.memoria import obter_memoria_operacional
 from core.clp import ControladorCLP
 from core.auto_memoria import CicloAutomaticoMemorias
+from core.validacoes_memoria import AvaliadorCasosMemoria
 
 # Carrega variáveis do arquivo .env
 load_dotenv()
@@ -231,6 +232,7 @@ class InterfaceApp(QMainWindow):
         self.memoria_operacional = obter_memoria_operacional()
         self.controlador_clp = ControladorCLP()
         self.ciclo_auto_memoria = CicloAutomaticoMemorias()
+        self.avaliador_casos = AvaliadorCasosMemoria()
         self.memoria_auto_alvo = None
         
         self.api = ClienteApiSpacecom()
@@ -377,6 +379,18 @@ class InterfaceApp(QMainWindow):
         serial = serial_recebido.strip()
         if SegurancaSette.validar_serial(serial):
             self.log_terminal(f"Serial Lido: {serial}")
+            memoria_alvo, motivo = self.avaliador_casos.avaliar(serial)
+            if memoria_alvo:
+                self.log_terminal(f"[VALIDACAO] Serial {serial} caiu no caso {motivo} -> {memoria_alvo}")
+                self.ciclo_auto_memoria.processar_serial(
+                    serial,
+                    self.controlador_clp,
+                    self.log_terminal,
+                    memoria_alvo=memoria_alvo,
+                )
+                self.log_terminal(f"[VALIDACAO] Fluxo bloqueado para serial {serial}")
+                return
+
             if self.memoria_auto_alvo:
                 self.ciclo_auto_memoria.processar_serial(
                     serial,
