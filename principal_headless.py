@@ -159,7 +159,7 @@ class GerenciadorPersistencia:
                     dados_envio["serial"],
                     dados_envio["tipo"],
                     dados_envio["jiga"],
-                    "A" if sucesso_api else "R",
+                    dados_envio.get("status", "A" if sucesso_api else "R"),
                     json.dumps(resposta_api),
                     sucesso_api,
                     dados_envio["valor_estanqueidade"],
@@ -568,6 +568,26 @@ def _tentar_pareamentos(fila_pareamento, estado, api, persistencia):
         processar_serial(serial_produto, api, persistencia, dados_teste)
 
 
+def _publicar_resultado_pendente_sem_xir(estado, fila_pareamento):
+    """Fallback para cenarios em que o frame XIR nao chega.
+
+    Quando uma nova serial entra e ha resultado pronto do ciclo anterior,
+    publica o resultado para o pareamento sem depender do XIR.
+    """
+    teste_em_andamento = estado.get("teste_em_andamento")
+    if not teste_em_andamento:
+        return
+
+    resultado = teste_em_andamento.get("resultado")
+    resultado_publicado = teste_em_andamento.get("resultado_publicado", False)
+    if not resultado or resultado_publicado:
+        return
+
+    fila_pareamento.adicionar_resultado(resultado)
+    teste_em_andamento["resultado_publicado"] = True
+    print("[G3I] Resultado publicado sem XIR (fallback no recebimento da proxima serial).")
+
+
 def processar_linha(linha, api, persistencia, estado, fila_pareamento):
     linha_limpa = linha.strip()
     print(f"[RAW] {linha_limpa}")
@@ -576,7 +596,11 @@ def processar_linha(linha, api, persistencia, estado, fila_pareamento):
     if fim_teste:
         print(f"[G3I] Fim de teste detectado: {fim_teste['raw']}")
         teste_em_andamento = estado.get("teste_em_andamento")
-        if teste_em_andamento and teste_em_andamento.get("resultado"):
+        if (
+            teste_em_andamento
+            and teste_em_andamento.get("resultado")
+            and not teste_em_andamento.get("resultado_publicado", False)
+        ):
             fila_pareamento.adicionar_resultado(teste_em_andamento["resultado"])
             _tentar_pareamentos(fila_pareamento, estado, api, persistencia)
         else:
@@ -594,6 +618,7 @@ def processar_linha(linha, api, persistencia, estado, fila_pareamento):
             estado["teste_em_andamento"] = {
                 "programa_teste": estado.get("programa_teste"),
                 "resultado": None,
+                "resultado_publicado": False,
             }
         return
 
@@ -603,9 +628,11 @@ def processar_linha(linha, api, persistencia, estado, fila_pareamento):
             estado["teste_em_andamento"] = {
                 "programa_teste": estado.get("programa_teste"),
                 "resultado": None,
+                "resultado_publicado": False,
             }
 
         estado["teste_em_andamento"]["resultado"] = resultado
+        estado["teste_em_andamento"]["resultado_publicado"] = False
         estado["serial_origem_g3i"] = resultado["serial_origem"]
         print(
             "[G3I] Resultado bruto recebido: "
@@ -618,6 +645,9 @@ def processar_linha(linha, api, persistencia, estado, fila_pareamento):
         return
 
     if SegurancaSette.validar_serial(linha_limpa):
+        _publicar_resultado_pendente_sem_xir(estado, fila_pareamento)
+        _tentar_pareamentos(fila_pareamento, estado, api, persistencia)
+
         auto_memoria = estado.get("auto_memoria")
         controlador_clp = estado.get("controlador_clp")
         avaliador_casos = estado.get("avaliador_casos")

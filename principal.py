@@ -133,7 +133,7 @@ class GerenciadorPersistencia:
                 dados_envio['serial'], 
                 dados_envio['tipo'], 
                 dados_envio['jiga'], 
-                'A' if sucesso_api else 'R',
+                dados_envio.get('status', 'A' if sucesso_api else 'R'),
                 json.dumps(resposta_api),
                 sucesso_api,
                 dados_envio['valor_estanqueidade'],
