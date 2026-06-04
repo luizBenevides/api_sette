@@ -698,13 +698,8 @@ def executar_fluxo_duplo(api, persistencia):
                 continue
 
             if origem == "scanner":
-                if SegurancaSette.validar_serial(valor):
-                    fila_pareamento.adicionar_serial(valor)
-                    print(f"[BARCODE] Serial capturado: {valor}")
-                    _tentar_pareamentos(fila_pareamento, estado, api, persistencia)
-                    continue
-
-                print(f"[BARCODE] Leitura ignorada: {valor}")
+                processar_linha(valor, api, persistencia, estado, fila_pareamento)
+                continue
     except KeyboardInterrupt:
         print("[INIT] Encerrando...")
         parar_evento.set()
