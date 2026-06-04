@@ -231,6 +231,7 @@ class InterfaceApp(QMainWindow):
         self.memoria_operacional = obter_memoria_operacional()
         self.controlador_clp = ControladorCLP()
         self.ciclo_auto_memoria = CicloAutomaticoMemorias()
+        self.memoria_auto_alvo = None
         
         self.api = ClienteApiSpacecom()
         self.dados = GerenciadorPersistencia()
@@ -376,8 +377,14 @@ class InterfaceApp(QMainWindow):
         serial = serial_recebido.strip()
         if SegurancaSette.validar_serial(serial):
             self.log_terminal(f"Serial Lido: {serial}")
-            if self.ciclo_auto_memoria.processar_serial(serial, self.controlador_clp, self.log_terminal):
-                return
+            if self.memoria_auto_alvo:
+                self.ciclo_auto_memoria.processar_serial(
+                    serial,
+                    self.controlador_clp,
+                    self.log_terminal,
+                    memoria_alvo=self.memoria_auto_alvo,
+                )
+                self.memoria_auto_alvo = None
 
             self.fila_serial.enfileirar(serial)
             self.fila_eventos.put("processar")

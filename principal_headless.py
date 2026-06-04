@@ -619,8 +619,10 @@ def processar_linha(linha, api, persistencia, estado, fila_pareamento):
     if SegurancaSette.validar_serial(linha_limpa):
         auto_memoria = estado.get("auto_memoria")
         controlador_clp = estado.get("controlador_clp")
-        if auto_memoria and auto_memoria.processar_serial(linha_limpa, controlador_clp, print):
-            return
+        memoria_alvo = estado.get("auto_memoria_memoria_alvo")
+        if auto_memoria and memoria_alvo:
+            auto_memoria.processar_serial(linha_limpa, controlador_clp, print, memoria_alvo=memoria_alvo)
+            estado["auto_memoria_memoria_alvo"] = None
 
         fila_pareamento.adicionar_serial(linha_limpa)
         print(f"[BARCODE] Serial capturado: {linha_limpa}")
@@ -650,6 +652,7 @@ def executar_fluxo_duplo(api, persistencia):
         "serial_origem_g3i": None,
         "memoria_operacional": obter_memoria_operacional(),
         "auto_memoria": CicloAutomaticoMemorias(),
+        "auto_memoria_memoria_alvo": None,
         "controlador_clp": controlador_clp,
     }
     fila_pareamento = FilaPareamentoFIFO(
@@ -744,6 +747,7 @@ def main():
         "serial_origem_g3i": None,
         "memoria_operacional": obter_memoria_operacional(),
         "auto_memoria": CicloAutomaticoMemorias(),
+        "auto_memoria_memoria_alvo": None,
         "controlador_clp": controlador_clp,
     }
     fila_pareamento = FilaPareamentoFIFO(
