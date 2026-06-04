@@ -12,9 +12,24 @@ from queue import Queue, Empty
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
-from PySide6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget, QLabel, QTextEdit
+from PySide6.QtWidgets import (
+    QApplication,
+    QGridLayout,
+    QHBoxLayout,
+    QLineEdit,
+    QMainWindow,
+    QPushButton,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+    QLabel,
+)
 from pynput import keyboard
 import time
+
+from core.memoria import obter_memoria_operacional
+from core.clp import ControladorCLP
+from core.auto_memoria import CicloAutomaticoMemorias
 
 # Carrega variáveis do arquivo .env
 load_dotenv()
@@ -212,7 +227,10 @@ class InterfaceApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("SETTE - Integrador (Global)")
-        self.setFixedSize(500, 350)
+        self.setFixedSize(820, 520)
+        self.memoria_operacional = obter_memoria_operacional()
+        self.controlador_clp = ControladorCLP()
+        self.ciclo_auto_memoria = CicloAutomaticoMemorias()
         
         self.api = ClienteApiSpacecom()
         self.dados = GerenciadorPersistencia()
@@ -232,22 +250,135 @@ class InterfaceApp(QMainWindow):
         layout = QVBoxLayout()
         self.label_status = QLabel("MONITORANDO LEITOR (BACKGROUND ATIVO)")
         self.label_status.setStyleSheet("font-weight: bold; color: green;")
+
+        self.label_clp = QLabel(
+            f"CLP {self.controlador_clp.ip}:{self.controlador_clp.porta} | Protocolo: {self.controlador_clp.protocolo}"
+        )
+        self.label_clp.setStyleSheet("font-weight: bold; color: #1f4e79;")
+
+        self.input_ip_clp = QLineEdit(self.controlador_clp.ip)
+        self.input_ip_clp.setPlaceholderText("IP do CLP")
+
+        self.input_porta_clp = QLineEdit(str(self.controlador_clp.porta))
+        self.input_porta_clp.setPlaceholderText("Porta TCP")
+
+        topo = QGridLayout()
+        topo.addWidget(QLabel("IP CLP:"), 0, 0)
+        topo.addWidget(self.input_ip_clp, 0, 1)
+        topo.addWidget(QLabel("Porta:"), 0, 2)
+        topo.addWidget(self.input_porta_clp, 0, 3)
+
+        self.status_memoria = QLabel("Memorias prontas para teste: M130, M131, M132, M133")
+        self.status_memoria.setStyleSheet("color: #444;")
+        if self.ciclo_auto_memoria.habilitado():
+            self.status_memoria.setText("Modo automatico de memorias ATIVO")
+
+        botoes_memoria = QGridLayout()
+        self.btn_m130 = QPushButton("Acionar M130 - Serial sem integracao")
+        self.btn_m131 = QPushButton("Acionar M131 - Produto aprovado/finalizado")
+        self.btn_m132 = QPushButton("Acionar M132 - Reteste apos 30 min")
+        self.btn_m133 = QPushButton("Acionar M133 - 2 testes reprovados")
+        self.btn_testar_clp = QPushButton("Testar conexao CLP")
+        self.btn_reset_m130 = QPushButton("Reset M130")
+        self.btn_reset_m131 = QPushButton("Reset M131")
+        self.btn_reset_m132 = QPushButton("Reset M132")
+        self.btn_reset_m133 = QPushButton("Reset M133")
+
+        self.btn_m130.clicked.connect(lambda: self.acionar_memoria_clp("M130"))
+        self.btn_m131.clicked.connect(lambda: self.acionar_memoria_clp("M131"))
+        self.btn_m132.clicked.connect(lambda: self.acionar_memoria_clp("M132"))
+        self.btn_m133.clicked.connect(lambda: self.acionar_memoria_clp("M133"))
+        self.btn_testar_clp.clicked.connect(self.testar_conexao_clp)
+        self.btn_reset_m130.clicked.connect(lambda: self.resetar_memoria_clp("M130"))
+        self.btn_reset_m131.clicked.connect(lambda: self.resetar_memoria_clp("M131"))
+        self.btn_reset_m132.clicked.connect(lambda: self.resetar_memoria_clp("M132"))
+        self.btn_reset_m133.clicked.connect(lambda: self.resetar_memoria_clp("M133"))
+
+        botoes_memoria.addWidget(self.btn_m130, 0, 0)
+        botoes_memoria.addWidget(self.btn_m131, 0, 1)
+        botoes_memoria.addWidget(self.btn_m132, 1, 0)
+        botoes_memoria.addWidget(self.btn_m133, 1, 1)
+        botoes_memoria.addWidget(self.btn_testar_clp, 2, 0, 1, 2)
+        botoes_memoria.addWidget(self.btn_reset_m130, 3, 0)
+        botoes_memoria.addWidget(self.btn_reset_m131, 3, 1)
+        botoes_memoria.addWidget(self.btn_reset_m132, 4, 0)
+        botoes_memoria.addWidget(self.btn_reset_m133, 4, 1)
         
         self.terminal = QTextEdit()
         self.terminal.setReadOnly(True)
         self.terminal.setStyleSheet("background-color: black; color: #00FF00; font-family: Courier;")
         
+        layout.addWidget(self.label_clp)
+        layout.addLayout(topo)
         layout.addWidget(self.label_status)
+        layout.addWidget(self.status_memoria)
+        layout.addLayout(botoes_memoria)
         layout.addWidget(self.terminal)
         
         container = QWidget()
         container.setLayout(layout)
         self.setCentralWidget(container)
 
+    def atualizar_config_clp(self):
+        self.controlador_clp.ip = self.input_ip_clp.text().strip() or self.controlador_clp.ip
+        try:
+            self.controlador_clp.porta = int(self.input_porta_clp.text().strip())
+        except ValueError:
+            self.log_terminal("Porta CLP invalida. Mantendo valor atual.")
+        self.label_clp.setText(
+            f"CLP {self.controlador_clp.ip}:{self.controlador_clp.porta} | Protocolo: {self.controlador_clp.protocolo}"
+        )
+
+    def testar_conexao_clp(self):
+        self.atualizar_config_clp()
+        try:
+            conectado = self.controlador_clp.testar_conexao()
+            self.status_memoria.setText(f"Conexao CLP: {'OK' if conectado else 'FALHA'}")
+            self.log_terminal(f"[CLP] teste de conexao {'OK' if conectado else 'FALHA'}")
+        except Exception as erro:
+            self.status_memoria.setText("Conexao CLP: ERRO")
+            self.log_terminal(f"[CLP] erro no teste de conexao: {erro}")
+
+    def acionar_memoria_clp(self, memoria):
+        self.atualizar_config_clp()
+        try:
+            self.status_memoria.setText(f"Acionando {memoria}...")
+            resultado = self.controlador_clp.acionar_memoria(memoria)
+            if resultado:
+                self.ciclo_auto_memoria.registrar_ativacao(memoria)
+                self.status_memoria.setText(f"{memoria} ligada e aguardando reset")
+                self.log_terminal(f"[CLP] {memoria} ligada e aguardando reset manual")
+            else:
+                self.status_memoria.setText(f"{memoria} nao acionada")
+                self.log_terminal(f"[CLP] {memoria} nao acionada")
+        except Exception as erro:
+            self.status_memoria.setText(f"Erro ao acionar {memoria}")
+            self.log_terminal(f"[CLP] erro ao acionar {memoria}: {erro}")
+
+    def resetar_memoria_clp(self, memoria):
+        self.atualizar_config_clp()
+        try:
+            self.status_memoria.setText(f"Resetando {memoria}...")
+            resultado = self.controlador_clp.resetar_memoria(memoria)
+            if self.ciclo_auto_memoria.possui_pendente() and self.ciclo_auto_memoria.memoria_pendente == memoria:
+                self.ciclo_auto_memoria.consumir_pendente()
+            if resultado:
+                self.status_memoria.setText(f"{memoria} resetada")
+                self.log_terminal(f"[CLP] {memoria} resetada com sucesso")
+            else:
+                self.status_memoria.setText(f"{memoria} nao foi resetada")
+                self.log_terminal(f"[CLP] {memoria} nao foi resetada")
+        except Exception as erro:
+            self.status_memoria.setText(f"Erro ao resetar {memoria}")
+            self.log_terminal(f"[CLP] erro ao resetar {memoria}: {erro}")
+
     def validar_e_processar(self, serial_recebido):
         serial = serial_recebido.strip()
         if SegurancaSette.validar_serial(serial):
             self.log_terminal(f"Serial Lido: {serial}")
+            if self.ciclo_auto_memoria.processar_serial(serial, self.controlador_clp, self.log_terminal):
+                return
+
             self.fila_serial.enfileirar(serial)
             self.fila_eventos.put("processar")
         else:

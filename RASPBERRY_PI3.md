@@ -196,6 +196,32 @@ dmesg | tail -n 50
 
 Se necessario, ajuste INPUT_MODE e variaveis correspondentes no .env.
 
+## 5.1) Memoria operacional para automacao e CLP
+
+Antes de o time de automacao fechar as 4 telas, ja deixe estes campos preparados no .env e no codigo:
+
+```env
+CLP_TRANSPORTE=ethernet
+CLP_PROTOCOLO=tcp
+CLP_IP=
+CLP_PORTA_TCP=502
+CLP_INTERFACE_REDE=eth0
+CLP_TIMEOUT_SEG=3
+RASPBERRY_IP=
+RETESTE_MINUTOS_MINIMO=30
+RETESTE_FALHAS_MAXIMAS=2
+STATUS_MEMORIA_ABERTA=1
+```
+
+Telas previstas na memoria operacional:
+
+- Serial sem integracao
+- Produto ja aprovado ou finalizado
+- Reteste antes dos 30 minutos na mesma peca
+- Bloqueio de reteste apos 2 falhas
+
+Se o CLP ainda nao tiver o protocolo final, mantenha os campos de IP e porta vazios e ajuste apenas quando a equipe de automacao informar o cabo Ethernet, o endereco do CLP e o endereco do Raspberry.
+
 Se a ideia for receber o teste da G3i pela serial e depois ler o serial do produto pelo scanner, use:
 
 ```env

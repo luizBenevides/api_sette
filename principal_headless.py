@@ -14,6 +14,10 @@ import requests
 import serial
 from dotenv import load_dotenv
 
+from core.memoria import obter_memoria_operacional
+from core.clp import ControladorCLP
+from core.auto_memoria import CicloAutomaticoMemorias
+
 try:
     from evdev import InputDevice, ecodes  # pyright: ignore[reportMissingImports]
 except Exception:
@@ -613,6 +617,11 @@ def processar_linha(linha, api, persistencia, estado, fila_pareamento):
         return
 
     if SegurancaSette.validar_serial(linha_limpa):
+        auto_memoria = estado.get("auto_memoria")
+        controlador_clp = estado.get("controlador_clp")
+        if auto_memoria and auto_memoria.processar_serial(linha_limpa, controlador_clp, print):
+            return
+
         fila_pareamento.adicionar_serial(linha_limpa)
         print(f"[BARCODE] Serial capturado: {linha_limpa}")
         _tentar_pareamentos(fila_pareamento, estado, api, persistencia)
@@ -633,10 +642,15 @@ def _worker_leitor(nome_fonte, leitor, fila_eventos, parar_evento):
 
 
 def executar_fluxo_duplo(api, persistencia):
+    controlador_clp = ControladorCLP()
+    print(f"[INIT] CLP configurado em {controlador_clp.ip}:{controlador_clp.porta} via {controlador_clp.protocolo}")
     estado = {
         "programa_teste": os.getenv("PROGRAMA_TESTE_PADRAO", "SETTE_V1"),
         "teste_em_andamento": None,
         "serial_origem_g3i": None,
+        "memoria_operacional": obter_memoria_operacional(),
+        "auto_memoria": CicloAutomaticoMemorias(),
+        "controlador_clp": controlador_clp,
     }
     fila_pareamento = FilaPareamentoFIFO(
         timeout_serial_seg=int(os.getenv("FIFO_TIMEOUT_SERIAL_SEG", "1800")),
@@ -711,7 +725,17 @@ def main():
 
     api = ClienteApiSpacecom()
     persistencia = GerenciadorPersistencia()
+    controlador_clp = None
+    try:
+        from core.clp import ControladorCLP
+
+        controlador_clp = ControladorCLP()
+    except Exception as erro:
+        print(f"[AUTO] Controlador CLP indisponivel: {erro}")
     modo = os.getenv("INPUT_MODE", "auto").strip().lower()
+    print(f"[INIT] AUTO_MEMORIA_MODO={os.getenv('AUTO_MEMORIA_MODO', '0')}")
+    if controlador_clp:
+        print(f"[INIT] CLP configurado em {controlador_clp.ip}:{controlador_clp.porta} via {controlador_clp.protocolo}")
 
     if modo == "dual":
         print("[INIT] INPUT_MODE=dual -> lendo maquina + scanner em paralelo")
@@ -723,6 +747,9 @@ def main():
         "programa_teste": os.getenv("PROGRAMA_TESTE_PADRAO", "SETTE_V1"),
         "teste_em_andamento": None,
         "serial_origem_g3i": None,
+        "memoria_operacional": obter_memoria_operacional(),
+        "auto_memoria": CicloAutomaticoMemorias(),
+        "controlador_clp": controlador_clp,
     }
     fila_pareamento = FilaPareamentoFIFO(
         timeout_serial_seg=int(os.getenv("FIFO_TIMEOUT_SERIAL_SEG", "1800")),
