@@ -1,10 +1,13 @@
 from PySide6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QLineEdit, QPushButton, QLabel, QMessageBox
 
+from core.memoria import obter_memoria_operacional
+
 class JanelaPrincipal(QMainWindow):
     def __init__(self, controlador):
         super().__init__()
         self.controlador = controlador
         self.setWindowTitle("Sistema de Integração SETTE")
+        self.memoria_operacional = obter_memoria_operacional()
         
         layout = QVBoxLayout()
         self.entrada_serial = QLineEdit()

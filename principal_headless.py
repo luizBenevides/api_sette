@@ -14,6 +14,11 @@ import requests
 import serial
 from dotenv import load_dotenv
 
+from core.memoria import obter_memoria_operacional
+from core.clp import ControladorCLP
+from core.auto_memoria import CicloAutomaticoMemorias
+from core.validacoes_memoria import AvaliadorCasosMemoria
+
 try:
     from evdev import InputDevice, ecodes  # pyright: ignore[reportMissingImports]
 except Exception:
@@ -154,7 +159,7 @@ class GerenciadorPersistencia:
                     dados_envio["serial"],
                     dados_envio["tipo"],
                     dados_envio["jiga"],
-                    "A" if sucesso_api else "R",
+                    dados_envio.get("status", "A" if sucesso_api else "R"),
                     json.dumps(resposta_api),
                     sucesso_api,
                     dados_envio["valor_estanqueidade"],
@@ -563,6 +568,26 @@ def _tentar_pareamentos(fila_pareamento, estado, api, persistencia):
         processar_serial(serial_produto, api, persistencia, dados_teste)
 
 
+def _publicar_resultado_pendente_sem_xir(estado, fila_pareamento):
+    """Fallback para cenarios em que o frame XIR nao chega.
+
+    Quando uma nova serial entra e ha resultado pronto do ciclo anterior,
+    publica o resultado para o pareamento sem depender do XIR.
+    """
+    teste_em_andamento = estado.get("teste_em_andamento")
+    if not teste_em_andamento:
+        return
+
+    resultado = teste_em_andamento.get("resultado")
+    resultado_publicado = teste_em_andamento.get("resultado_publicado", False)
+    if not resultado or resultado_publicado:
+        return
+
+    fila_pareamento.adicionar_resultado(resultado)
+    teste_em_andamento["resultado_publicado"] = True
+    print("[G3I] Resultado publicado sem XIR (fallback no recebimento da proxima serial).")
+
+
 def processar_linha(linha, api, persistencia, estado, fila_pareamento):
     linha_limpa = linha.strip()
     print(f"[RAW] {linha_limpa}")
@@ -571,7 +596,11 @@ def processar_linha(linha, api, persistencia, estado, fila_pareamento):
     if fim_teste:
         print(f"[G3I] Fim de teste detectado: {fim_teste['raw']}")
         teste_em_andamento = estado.get("teste_em_andamento")
-        if teste_em_andamento and teste_em_andamento.get("resultado"):
+        if (
+            teste_em_andamento
+            and teste_em_andamento.get("resultado")
+            and not teste_em_andamento.get("resultado_publicado", False)
+        ):
             fila_pareamento.adicionar_resultado(teste_em_andamento["resultado"])
             _tentar_pareamentos(fila_pareamento, estado, api, persistencia)
         else:
@@ -589,6 +618,7 @@ def processar_linha(linha, api, persistencia, estado, fila_pareamento):
             estado["teste_em_andamento"] = {
                 "programa_teste": estado.get("programa_teste"),
                 "resultado": None,
+                "resultado_publicado": False,
             }
         return
 
@@ -598,9 +628,11 @@ def processar_linha(linha, api, persistencia, estado, fila_pareamento):
             estado["teste_em_andamento"] = {
                 "programa_teste": estado.get("programa_teste"),
                 "resultado": None,
+                "resultado_publicado": False,
             }
 
         estado["teste_em_andamento"]["resultado"] = resultado
+        estado["teste_em_andamento"]["resultado_publicado"] = False
         estado["serial_origem_g3i"] = resultado["serial_origem"]
         print(
             "[G3I] Resultado bruto recebido: "
@@ -613,10 +645,44 @@ def processar_linha(linha, api, persistencia, estado, fila_pareamento):
         return
 
     if SegurancaSette.validar_serial(linha_limpa):
+        _publicar_resultado_pendente_sem_xir(estado, fila_pareamento)
+        _tentar_pareamentos(fila_pareamento, estado, api, persistencia)
+
+        auto_memoria = estado.get("auto_memoria")
+        controlador_clp = estado.get("controlador_clp")
+        avaliador_casos = estado.get("avaliador_casos")
+        memoria_alvo = estado.get("auto_memoria_memoria_alvo")
+
+        # Sempre tenta limpar memoria pendente para liberar a maquina
+        # antes de avaliar se a serial atual cai em um novo caso.
+        if auto_memoria:
+            auto_memoria.processar_serial(linha_limpa, controlador_clp, print, memoria_alvo=None)
+
+        if memoria_alvo is None and avaliador_casos:
+            memoria_alvo, motivo = avaliador_casos.avaliar(linha_limpa)
+            if memoria_alvo:
+                estado["auto_memoria_memoria_alvo"] = memoria_alvo
+                print(f"[VALIDACAO] Serial {linha_limpa} caiu no caso {motivo} -> {memoria_alvo}")
+
+        if auto_memoria and memoria_alvo:
+            auto_memoria.processar_serial(linha_limpa, controlador_clp, print, memoria_alvo=memoria_alvo)
+            estado["auto_memoria_memoria_alvo"] = None
+            print(f"[VALIDACAO] Fluxo bloqueado para serial {linha_limpa} por caso de memoria")
+            return
+
         fila_pareamento.adicionar_serial(linha_limpa)
         print(f"[BARCODE] Serial capturado: {linha_limpa}")
         _tentar_pareamentos(fila_pareamento, estado, api, persistencia)
         return
+
+    if linha_limpa.isdigit():
+        auto_memoria = estado.get("auto_memoria")
+        controlador_clp = estado.get("controlador_clp")
+        if auto_memoria:
+            print(f"[VALIDACAO] Serial invalida {linha_limpa} -> M130")
+            auto_memoria.processar_serial(linha_limpa, controlador_clp, print, memoria_alvo="M130")
+            print(f"[VALIDACAO] Fluxo bloqueado para serial invalida {linha_limpa}")
+            return
 
     print(f"[RAW] Leitura ignorada: {linha_limpa}")
 
@@ -633,10 +699,17 @@ def _worker_leitor(nome_fonte, leitor, fila_eventos, parar_evento):
 
 
 def executar_fluxo_duplo(api, persistencia):
+    controlador_clp = ControladorCLP()
+    print(f"[INIT] CLP configurado em {controlador_clp.ip}:{controlador_clp.porta} via {controlador_clp.protocolo}")
     estado = {
         "programa_teste": os.getenv("PROGRAMA_TESTE_PADRAO", "SETTE_V1"),
         "teste_em_andamento": None,
         "serial_origem_g3i": None,
+        "memoria_operacional": obter_memoria_operacional(),
+        "auto_memoria": CicloAutomaticoMemorias(),
+        "auto_memoria_memoria_alvo": None,
+        "avaliador_casos": AvaliadorCasosMemoria(),
+        "controlador_clp": controlador_clp,
     }
     fila_pareamento = FilaPareamentoFIFO(
         timeout_serial_seg=int(os.getenv("FIFO_TIMEOUT_SERIAL_SEG", "1800")),
@@ -684,13 +757,8 @@ def executar_fluxo_duplo(api, persistencia):
                 continue
 
             if origem == "scanner":
-                if SegurancaSette.validar_serial(valor):
-                    fila_pareamento.adicionar_serial(valor)
-                    print(f"[BARCODE] Serial capturado: {valor}")
-                    _tentar_pareamentos(fila_pareamento, estado, api, persistencia)
-                    continue
-
-                print(f"[BARCODE] Leitura ignorada: {valor}")
+                processar_linha(valor, api, persistencia, estado, fila_pareamento)
+                continue
     except KeyboardInterrupt:
         print("[INIT] Encerrando...")
         parar_evento.set()
@@ -711,7 +779,17 @@ def main():
 
     api = ClienteApiSpacecom()
     persistencia = GerenciadorPersistencia()
+    controlador_clp = None
+    try:
+        from core.clp import ControladorCLP
+
+        controlador_clp = ControladorCLP()
+    except Exception as erro:
+        print(f"[AUTO] Controlador CLP indisponivel: {erro}")
     modo = os.getenv("INPUT_MODE", "auto").strip().lower()
+    print(f"[INIT] AUTO_MEMORIA_MODO={os.getenv('AUTO_MEMORIA_MODO', '0')}")
+    if controlador_clp:
+        print(f"[INIT] CLP configurado em {controlador_clp.ip}:{controlador_clp.porta} via {controlador_clp.protocolo}")
 
     if modo == "dual":
         print("[INIT] INPUT_MODE=dual -> lendo maquina + scanner em paralelo")
@@ -723,6 +801,11 @@ def main():
         "programa_teste": os.getenv("PROGRAMA_TESTE_PADRAO", "SETTE_V1"),
         "teste_em_andamento": None,
         "serial_origem_g3i": None,
+        "memoria_operacional": obter_memoria_operacional(),
+        "auto_memoria": CicloAutomaticoMemorias(),
+        "auto_memoria_memoria_alvo": None,
+        "avaliador_casos": AvaliadorCasosMemoria(),
+        "controlador_clp": controlador_clp,
     }
     fila_pareamento = FilaPareamentoFIFO(
         timeout_serial_seg=int(os.getenv("FIFO_TIMEOUT_SERIAL_SEG", "1800")),
