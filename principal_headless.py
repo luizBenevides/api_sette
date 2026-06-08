@@ -184,66 +184,77 @@ class GerenciadorPersistencia:
 
 
 class FilaPareamentoFIFO:
-    def __init__(self, timeout_serial_seg=1800, timeout_resultado_seg=1800):
+    def __init__(self, timeout_serial_seg=600, timeout_resultado_seg=600):
         self.serials = deque()
         self.resultados = deque()
         self.timeout_serial_seg = timeout_serial_seg
         self.timeout_resultado_seg = timeout_resultado_seg
+        self.lock = threading.Lock()
 
     def _agora(self):
         return time.time()
 
     def adicionar_serial(self, serial_produto):
-        item = {
-            "serial": serial_produto,
-            "criado_em": self._agora(),
-        }
-        self.serials.append(item)
-        print(
-            f"[QUEUE] Serial enfileirado: {serial_produto} | "
-            f"fila_seriais={len(self.serials)} fila_resultados={len(self.resultados)}"
-        )
+        with self.lock:
+            # Evita duplicados na fila de espera
+            if any(item["serial"] == serial_produto for item in self.serials):
+                print(f"[QUEUE] Serial {serial_produto} já está na fila. Ignorando duplicata.")
+                return
+
+            item = {
+                "serial": serial_produto,
+                "criado_em": self._agora(),
+            }
+            self.serials.append(item)
+            print(
+                f"[QUEUE] Serial enfileirado: {serial_produto} | "
+                f"fila_seriais={len(self.serials)} fila_resultados={len(self.resultados)}"
+            )
 
     def adicionar_resultado(self, resultado):
-        item = {
-            "resultado": resultado,
-            "criado_em": self._agora(),
-        }
-        self.resultados.append(item)
-        print(
-            f"[QUEUE] Resultado enfileirado: {resultado['raw']} | "
-            f"fila_seriais={len(self.serials)} fila_resultados={len(self.resultados)}"
-        )
+        with self.lock:
+            item = {
+                "resultado": resultado,
+                "criado_em": self._agora(),
+            }
+            self.resultados.append(item)
+            print(
+                f"[QUEUE] Resultado enfileirado: {resultado['raw']} | "
+                f"fila_seriais={len(self.serials)} fila_resultados={len(self.resultados)}"
+            )
 
     def limpar_expirados(self):
         agora = self._agora()
+        # Sem lock aqui pois eh chamada interna de quem ja tem o lock
 
         while self.serials and (agora - self.serials[0]["criado_em"]) > self.timeout_serial_seg:
             expirado = self.serials.popleft()
-            print(f"[QUEUE] Serial expirado sem resultado: {expirado['serial']}")
+            print(f"[QUEUE] Serial expirado (esteira): {expirado['serial']}")
 
         while self.resultados and (agora - self.resultados[0]["criado_em"]) > self.timeout_resultado_seg:
             expirado = self.resultados.popleft()
             print(f"[QUEUE] Resultado expirado sem serial: {expirado['resultado']['raw']}")
 
     def pode_parear(self):
-        self.limpar_expirados()
-        return bool(self.serials) and bool(self.resultados)
+        with self.lock:
+            self.limpar_expirados()
+            return bool(self.serials) and bool(self.resultados)
 
     def consumir_pareamento(self):
-        self.limpar_expirados()
-        if not self.serials or not self.resultados:
-            return None
+        with self.lock:
+            self.limpar_expirados()
+            if not self.serials or not self.resultados:
+                return None
 
-        serial_item = self.serials.popleft()
-        resultado_item = self.resultados.popleft()
+            serial_item = self.serials.popleft()
+            resultado_item = self.resultados.popleft()
 
-        print(
-            f"[QUEUE] Pareando FIFO: serial={serial_item['serial']} "
-            f"<-> resultado={resultado_item['resultado']['raw']}"
-        )
+            print(
+                f"[QUEUE] Pareando FIFO: serial={serial_item['serial']} "
+                f"<-> resultado={resultado_item['resultado']['raw']}"
+            )
 
-        return serial_item["serial"], resultado_item["resultado"]
+            return serial_item["serial"], resultado_item["resultado"]
 
     def estado_resumido(self):
         return f"seriais={len(self.serials)} resultados={len(self.resultados)}"
@@ -651,25 +662,24 @@ def processar_linha(linha, api, persistencia, estado, fila_pareamento):
         auto_memoria = estado.get("auto_memoria")
         controlador_clp = estado.get("controlador_clp")
         avaliador_casos = estado.get("avaliador_casos")
-        memoria_alvo = estado.get("auto_memoria_memoria_alvo")
 
-        # Sempre tenta limpar memoria pendente para liberar a maquina
-        # antes de avaliar se a serial atual cai em um novo caso.
+        # 1) Avalia se a serial cai em algum caso de bloqueio (M131, M132, M133)
+        memoria_bloqueio = None
+        if avaliador_casos:
+            memoria_bloqueio, motivo = avaliador_casos.avaliar(linha_limpa)
+            if memoria_bloqueio:
+                print(f"[VALIDACAO] Serial {linha_limpa} caiu no caso {motivo} -> {memoria_bloqueio}")
+
+        # 2) Processa o CLP apenas uma vez (seja para resetar o anterior ou para aplicar novo bloqueio)
         if auto_memoria:
-            auto_memoria.processar_serial(linha_limpa, controlador_clp, print, memoria_alvo=None)
+            bloqueado = auto_memoria.processar_serial(
+                linha_limpa, controlador_clp, print, memoria_alvo=memoria_bloqueio
+            )
+            if bloqueado:
+                print(f"[VALIDACAO] Fluxo bloqueado para serial {linha_limpa} por {memoria_bloqueio}")
+                return
 
-        if memoria_alvo is None and avaliador_casos:
-            memoria_alvo, motivo = avaliador_casos.avaliar(linha_limpa)
-            if memoria_alvo:
-                estado["auto_memoria_memoria_alvo"] = memoria_alvo
-                print(f"[VALIDACAO] Serial {linha_limpa} caiu no caso {motivo} -> {memoria_alvo}")
-
-        if auto_memoria and memoria_alvo:
-            auto_memoria.processar_serial(linha_limpa, controlador_clp, print, memoria_alvo=memoria_alvo)
-            estado["auto_memoria_memoria_alvo"] = None
-            print(f"[VALIDACAO] Fluxo bloqueado para serial {linha_limpa} por caso de memoria")
-            return
-
+        # Se nao bloqueou, segue o fluxo normal
         fila_pareamento.adicionar_serial(linha_limpa)
         print(f"[BARCODE] Serial capturado: {linha_limpa}")
         _tentar_pareamentos(fila_pareamento, estado, api, persistencia)
@@ -701,6 +711,8 @@ def _worker_leitor(nome_fonte, leitor, fila_eventos, parar_evento):
 def executar_fluxo_duplo(api, persistencia):
     controlador_clp = ControladorCLP()
     print(f"[INIT] CLP configurado em {controlador_clp.ip}:{controlador_clp.porta} via {controlador_clp.protocolo}")
+    
+    lock_global = threading.Lock()
     estado = {
         "programa_teste": os.getenv("PROGRAMA_TESTE_PADRAO", "SETTE_V1"),
         "teste_em_andamento": None,
@@ -712,8 +724,8 @@ def executar_fluxo_duplo(api, persistencia):
         "controlador_clp": controlador_clp,
     }
     fila_pareamento = FilaPareamentoFIFO(
-        timeout_serial_seg=int(os.getenv("FIFO_TIMEOUT_SERIAL_SEG", "1800")),
-        timeout_resultado_seg=int(os.getenv("FIFO_TIMEOUT_RESULTADO_SEG", "1800")),
+        timeout_serial_seg=int(os.getenv("FIFO_TIMEOUT_SERIAL_SEG", "600")),
+        timeout_resultado_seg=int(os.getenv("FIFO_TIMEOUT_RESULTADO_SEG", "600")),
     )
 
     leitor_maquina, leitor_scanner = criar_leitores_duplos()
@@ -752,13 +764,8 @@ def executar_fluxo_duplo(api, persistencia):
                 print(valor)
                 continue
 
-            if origem == "maquina":
+            with lock_global:
                 processar_linha(valor, api, persistencia, estado, fila_pareamento)
-                continue
-
-            if origem == "scanner":
-                processar_linha(valor, api, persistencia, estado, fila_pareamento)
-                continue
     except KeyboardInterrupt:
         print("[INIT] Encerrando...")
         parar_evento.set()

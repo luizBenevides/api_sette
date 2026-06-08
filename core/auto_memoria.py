@@ -34,22 +34,28 @@ class CicloAutomaticoMemorias:
     def processar_serial(self, serial_lido, controlador_clp, logger=print, memoria_alvo=None):
         """Executa apenas o que estiver explicitamente pendente ou solicitado.
 
-        Sem `memoria_alvo`, a leitura normal nao aciona nem reseta memorias.
-        Retorna True somente quando algum comando de CLP foi executado.
+        Evita resetar se a memoria alvo for a mesma que ja esta ligada.
         """
 
         if not self.habilitado() or controlador_clp is None:
             return False
 
-        if self.possui_pendente():
-            memoria_pendente = self.consumir_pendente()
-            if memoria_pendente:
-                logger(f"[AUTO] Serial {serial_lido}: resetando {memoria_pendente} antes do proximo ciclo")
-                try:
-                    controlador_clp.resetar_memoria(memoria_pendente)
-                except Exception as erro:
-                    logger(f"[AUTO] Erro ao resetar {memoria_pendente}: {erro}")
+        # Se ja temos uma memoria ligada e a nova memoria_alvo e a mesma, nao faz nada.
+        if self.memoria_pendente == memoria_alvo and memoria_alvo is not None:
+            logger(f"[AUTO] Serial {serial_lido}: {memoria_alvo} ja esta ativa. Mantendo.")
+            return False
 
+        # Se temos uma memoria ligada e a nova e diferente (ou None), precisamos resetar a atual.
+        if self.possui_pendente():
+            memoria_antiga = self.consumir_pendente()
+            if memoria_antiga:
+                logger(f"[AUTO] Serial {serial_lido}: resetando {memoria_antiga} para liberar/trocar")
+                try:
+                    controlador_clp.resetar_memoria(memoria_antiga)
+                except Exception as erro:
+                    logger(f"[AUTO] Erro ao resetar {memoria_antiga}: {erro}")
+
+        # Se agora temos uma nova memoria para ligar, ligamos.
         if memoria_alvo is None:
             return False
 
@@ -61,7 +67,6 @@ class CicloAutomaticoMemorias:
         try:
             if controlador_clp.acionar_memoria(memoria_alvo):
                 self.registrar_ativacao(memoria_alvo)
-                logger(f"[AUTO] {memoria_alvo} ligada e aguardando a proxima serial para reset")
                 return True
         except Exception as erro:
             logger(f"[AUTO] Falha ao acionar {memoria_alvo}: {erro}")
