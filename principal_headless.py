@@ -672,12 +672,13 @@ def processar_linha(linha, api, persistencia, estado, fila_pareamento):
 
         # 2) Processa o CLP apenas uma vez (seja para resetar o anterior ou para aplicar novo bloqueio)
         if auto_memoria:
-            bloqueado = auto_memoria.processar_serial(
+            auto_memoria.processar_serial(
                 linha_limpa, controlador_clp, print, memoria_alvo=memoria_bloqueio
             )
-            if bloqueado:
-                print(f"[VALIDACAO] Fluxo bloqueado para serial {linha_limpa} por {memoria_bloqueio}")
-                return
+            
+        if memoria_bloqueio:
+            print(f"[VALIDACAO] Fluxo bloqueado para serial {linha_limpa} por {memoria_bloqueio}")
+            return
 
         # Se nao bloqueou, segue o fluxo normal
         fila_pareamento.adicionar_serial(linha_limpa)
