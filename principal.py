@@ -156,20 +156,29 @@ class GerenciadorPersistencia:
 class FilaSerialFIFO:
     def __init__(self):
         self.itens = deque()
+        self.lock = threading.Lock()
 
     def enfileirar(self, serial):
-        self.itens.append(serial)
-        print(f"[QUEUE] Serial enfileirado: {serial} | total={len(self.itens)}")
+        with self.lock:
+            # Evita duplicados na fila de espera
+            if serial in self.itens:
+                print(f"[QUEUE] Serial {serial} já está na fila. Ignorando duplicata.")
+                return
+                
+            self.itens.append(serial)
+            print(f"[QUEUE] Serial enfileirado: {serial} | total={len(self.itens)}")
 
     def desenfileirar(self):
-        if not self.itens:
-            return None
-        serial = self.itens.popleft()
-        print(f"[QUEUE] Serial liberado para envio: {serial} | restante={len(self.itens)}")
-        return serial
+        with self.lock:
+            if not self.itens:
+                return None
+            serial = self.itens.popleft()
+            print(f"[QUEUE] Serial liberado para envio: {serial} | restante={len(self.itens)}")
+            return serial
 
     def vazio(self):
-        return not self.itens
+        with self.lock:
+            return not self.itens
 
 class ClienteApiSpacecom:
     def __init__(self):
@@ -380,35 +389,22 @@ class InterfaceApp(QMainWindow):
         if SegurancaSette.validar_serial(serial):
             self.log_terminal(f"Serial Lido: {serial}")
 
-            # Sempre tenta resetar memoria pendente para liberar a maquina
-            # antes de avaliar novo caso para a serial atual.
-            self.ciclo_auto_memoria.processar_serial(
+            # 1) Avalia se a serial cai em algum caso de bloqueio (M131, M132, M133)
+            memoria_bloqueio, motivo = self.avaliador_casos.avaliar(serial)
+            if memoria_bloqueio:
+                self.log_terminal(f"[VALIDACAO] Serial {serial} caiu no caso {motivo} -> {memoria_bloqueio}")
+
+            # 2) Processa o CLP apenas uma vez (seja para resetar o anterior ou para aplicar novo bloqueio)
+            bloqueado = self.ciclo_auto_memoria.processar_serial(
                 serial,
                 self.controlador_clp,
                 self.log_terminal,
-                memoria_alvo=None,
+                memoria_alvo=memoria_bloqueio,
             )
 
-            memoria_alvo, motivo = self.avaliador_casos.avaliar(serial)
-            if memoria_alvo:
-                self.log_terminal(f"[VALIDACAO] Serial {serial} caiu no caso {motivo} -> {memoria_alvo}")
-                self.ciclo_auto_memoria.processar_serial(
-                    serial,
-                    self.controlador_clp,
-                    self.log_terminal,
-                    memoria_alvo=memoria_alvo,
-                )
-                self.log_terminal(f"[VALIDACAO] Fluxo bloqueado para serial {serial}")
+            if bloqueado:
+                self.log_terminal(f"[VALIDACAO] Fluxo bloqueado para serial {serial} por {memoria_bloqueio}")
                 return
-
-            if self.memoria_auto_alvo:
-                self.ciclo_auto_memoria.processar_serial(
-                    serial,
-                    self.controlador_clp,
-                    self.log_terminal,
-                    memoria_alvo=self.memoria_auto_alvo,
-                )
-                self.memoria_auto_alvo = None
 
             self.fila_serial.enfileirar(serial)
             self.fila_eventos.put("processar")
