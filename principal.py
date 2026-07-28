@@ -130,11 +130,33 @@ class SegurancaSette:
 class GerenciadorPersistencia:
     def __init__(self):
         self.arquivo_txt = os.getenv("ARQUIVO_EMERGENCIA", "emergencia.txt")
+        self.dedup_seg = float(os.getenv("DB_DEDUP_SEG", "3"))
 
     def registrar_log(self, dados_envio, resposta_api, sucesso_api):
         try:
             conn = conectar_banco()
             cur = conn.cursor()
+            status_log = dados_envio.get('status', 'A' if sucesso_api else 'R')
+            tratamento_log = dados_envio.get('tratamento_clp') or ''
+            chave_lock = f"{dados_envio['serial']}|{status_log}|{tratamento_log}"
+            # Serializa processos concorrentes e impede duplicidade no banco.
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (chave_lock,))
+            cur.execute(
+                """
+                SELECT id FROM logs_producao
+                WHERE serial = %s
+                  AND resultado = %s
+                  AND COALESCE(tratamento_clp, '') = %s
+                  AND criado_em >= CURRENT_TIMESTAMP - (%s * INTERVAL '1 second')
+                ORDER BY criado_em DESC LIMIT 1
+                """,
+                (dados_envio['serial'], status_log, tratamento_log, self.dedup_seg),
+            )
+            duplicado = cur.fetchone()
+            if duplicado:
+                conn.rollback(); cur.close(); conn.close()
+                print(f"[DB] Duplicata concorrente ignorada: serial={dados_envio['serial']} id_existente={duplicado[0]}")
+                return False
             query = """
                 INSERT INTO logs_producao 
                 (serial, test_type, jiga_name, resultado, api_response_raw, enviado_api_externa, 
@@ -146,7 +168,7 @@ class GerenciadorPersistencia:
                 dados_envio['serial'], 
                 dados_envio['tipo'], 
                 dados_envio['jiga'], 
-                dados_envio.get('status', 'A' if sucesso_api else 'R'),
+                status_log,
                 json.dumps(resposta_api),
                 sucesso_api,
                 dados_envio['valor_estanqueidade'],
@@ -159,6 +181,7 @@ class GerenciadorPersistencia:
             cur.close()
             conn.close()
             print(" GRAVADO NO POSTGRES")
+            return True
         except Exception as e:
             print(f" ERRO BANCO: {e}")
             self.salvar_em_txt(dados_envio, resposta_api, e)
@@ -215,9 +238,9 @@ class ClienteApiSpacecom:
         auth = SegurancaSette.gerar_autenticacao("POST", "log")
 
         dados_teste = dados_teste or {}
-        valor_envio = dados_teste.get("valor_estanqueidade") or os.getenv("VALOR_ESTANQUEIDADE_PADRAO")
-        unidade_envio = dados_teste.get("unidade_medida") or os.getenv("UNIDADE_ESTANQUEIDADE_PADRAO")
-        programa_envio = dados_teste.get("programa_teste") or os.getenv("PROGRAMA_TESTE_PADRAO")
+        valor_envio = dados_teste.get("valor_estanqueidade") or os.getenv("VALOR_ESTANQUEIDADE_PADRAO") or "0"
+        unidade_envio = dados_teste.get("unidade_medida") or os.getenv("UNIDADE_ESTANQUEIDADE_PADRAO") or "ml/min"
+        programa_envio = dados_teste.get("programa_teste") or os.getenv("PROGRAMA_TESTE_PADRAO") or "SETTE_V1"
         status_envio = "A"
 
         if not all([valor_envio, unidade_envio, programa_envio, status_envio]):
