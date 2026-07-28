@@ -196,6 +196,22 @@ class GerenciadorPersistencia:
         }
         self.registrar_log(dados, {'bloqueado': True, 'memoria': 'M2100', 'validacao': memoria, 'motivo': motivo}, False)
 
+    def carregar_ultimos_estados(self):
+        """Retorna somente o evento mais recente de cada serial."""
+        conn = conectar_banco()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT DISTINCT ON (serial)
+                           criado_em, serial, resultado, tratamento_clp, motivo_tratamento
+                    FROM logs_producao
+                    WHERE serial IS NOT NULL AND TRIM(serial) <> ''
+                    ORDER BY serial, criado_em DESC, id DESC
+                """)
+                return cur.fetchall()
+        finally:
+            conn.close()
+
     def salvar_em_txt(self, dados, resposta, erro_db):
         with open(self.arquivo_txt, "a", encoding="utf-8") as f:
             f.write(f"DATA: {datetime.now()} | SERIAL: {dados['serial']} | ERRO: {erro_db} | RESPOSTA: {resposta}\n")
@@ -352,6 +368,7 @@ class DashboardSeriais(QDialog):
         self.total = 0
         self.aprovadas = 0
         self.tratamentos = 0
+        self.registros_por_serial = {}
         self.setWindowTitle("SETTE | Dashboard de Coleta")
         self.resize(1440, 850)
         self.setMinimumSize(1080, 680)
@@ -451,6 +468,9 @@ class DashboardSeriais(QDialog):
             self.btn_conectar.setText("Conectar com o CLP"); self.btn_conectar.setEnabled(True)
 
     def _atualizar_indicadores(self):
+        self.total = len(self.registros_por_serial)
+        self.aprovadas = sum(1 for registro in self.registros_por_serial.values() if registro["validacao"] == "-")
+        self.tratamentos = self.total - self.aprovadas
         self.lbl_aprovadas.setText(str(self.aprovadas))
         self.lbl_tratamentos.setText(str(self.tratamentos))
         self.lbl_total.setText(str(self.total))
@@ -460,22 +480,49 @@ class DashboardSeriais(QDialog):
         self.lbl_pct_tratamentos.setText(f"{pct_tratamentos:.0f}%")
         self.lbl_pct_total.setText("100%" if self.total else "0%")
 
-    def registrar_leitura(self, serial, status, validacao="-", motivo="-"):
-        em_tratamento = validacao != "-"
-        self.total += 1
-        if em_tratamento: self.tratamentos += 1
-        else: self.aprovadas += 1
-        self._atualizar_indicadores()
+    def registrar_leitura(self, serial, status, validacao="-", motivo="-", horario=None):
+        chave = (serial or "(vazia)").strip()
+        self.registros_por_serial[chave] = {
+            "horario": horario or datetime.now(), "serial": chave, "status": status,
+            "validacao": validacao or "-", "motivo": motivo or "-",
+        }
+        self._renderizar_registros()
 
-        self.tabela.insertRow(0)
-        valores = [datetime.now().strftime("%d/%m/%Y %H:%M:%S"), serial or "(vazia)", status, validacao, motivo]
-        fundo = QColor("#352f22" if em_tratamento else "#1d2b25")
-        texto = QColor("#fde68a" if em_tratamento else "#d1fae5")
-        for coluna, valor in enumerate(valores):
-            item = QTableWidgetItem(str(valor)); item.setBackground(fundo); item.setForeground(texto)
-            self.tabela.setItem(0, coluna, item)
-        if self.tabela.rowCount() > 1000:
-            self.tabela.removeRow(self.tabela.rowCount() - 1)
+    def carregar_do_banco(self, registros):
+        self.registros_por_serial.clear()
+        for criado_em, serial, resultado, tratamento_clp, motivo_tratamento in registros:
+            motivo = motivo_tratamento or "-"
+            validacao = "-"
+            if tratamento_clp:
+                validacao = motivo.split(":", 1)[0] if ":" in motivo else tratamento_clp
+                motivo = motivo.split(":", 1)[1] if ":" in motivo else motivo
+            self.registros_por_serial[str(serial).strip()] = {
+                "horario": criado_em, "serial": str(serial).strip(),
+                "status": "BLOQUEADA" if tratamento_clp else "APROVADA (A)",
+                "validacao": validacao, "motivo": motivo,
+            }
+        self._renderizar_registros()
+
+    def _renderizar_registros(self):
+        self._atualizar_indicadores()
+        registros = sorted(
+            self.registros_por_serial.values(),
+            key=lambda item: item["horario"].timestamp() if hasattr(item["horario"], "timestamp") else 0,
+            reverse=True,
+        )
+        self.tabela.setRowCount(0)
+        for registro in registros[:1000]:
+            linha = self.tabela.rowCount(); self.tabela.insertRow(linha)
+            horario = registro["horario"]
+            if hasattr(horario, "strftime"):
+                horario = horario.strftime("%d/%m/%Y %H:%M:%S")
+            valores = [horario, registro["serial"], registro["status"], registro["validacao"], registro["motivo"]]
+            em_tratamento = registro["validacao"] != "-"
+            fundo = QColor("#352f22" if em_tratamento else "#1d2b25")
+            texto = QColor("#fde68a" if em_tratamento else "#d1fae5")
+            for coluna, valor in enumerate(valores):
+                item = QTableWidgetItem(str(valor)); item.setBackground(fundo); item.setForeground(texto)
+                self.tabela.setItem(linha, coluna, item)
 
 
 class InterfaceApp(QMainWindow):
@@ -504,6 +551,7 @@ class InterfaceApp(QMainWindow):
         
         self.configurar_ui()
         self.dashboard = DashboardSeriais(self.testar_conexao_clp, self)
+        self.carregar_dashboard_do_banco()
 
         # Inicializa o ouvinte global somente depois de todas as telas estarem prontas.
         self.ouvinte = OuvinteGlobal()
@@ -607,6 +655,14 @@ class InterfaceApp(QMainWindow):
 
     def abrir_dashboard(self):
         self.dashboard.showMaximized(); self.dashboard.raise_(); self.dashboard.activateWindow()
+
+    def carregar_dashboard_do_banco(self):
+        try:
+            registros = self.dados.carregar_ultimos_estados()
+            self.dashboard.carregar_do_banco(registros)
+            self.log_terminal(f"[DB] Dashboard carregado: {len(registros)} seriais unicas")
+        except Exception as erro:
+            self.log_terminal(f"[DB] Nao foi possivel carregar o dashboard: {erro}")
 
     def testar_conexao_banco(self):
         try:
