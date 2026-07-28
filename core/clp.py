@@ -1,4 +1,4 @@
-"""Controlador de CLP para acionar memorias por Ethernet.
+﻿"""Controlador de CLP para acionar memorias e registradores por Ethernet.
 
 Assume Modbus TCP como transporte padrao enquanto o protocolo final nao for confirmado.
 """
@@ -7,10 +7,7 @@ import os
 
 
 MEMORIAS_PADRAO = {
-    "M130": 130,
-    "M131": 131,
-    "M132": 132,
-    "M133": 133,
+    "M2100": 2100,
 }
 
 
@@ -82,8 +79,54 @@ class ControladorCLP:
         print(f"[CLP] {nome_memoria} mantida ligada aguardando reset manual")
         return True
 
+    def escrever_registrador(self, endereco, valor, device_id=1):
+        """Escreve um holding register Modbus (funcao 06)."""
+        endereco, valor, device_id = int(endereco), int(valor), int(device_id)
+        if not 0 <= endereco <= 65535 or not 0 <= valor <= 65535:
+            raise ValueError("Endereco e valor devem estar entre 0 e 65535")
+        cliente = self._obter_cliente_modbus()
+        if not cliente.connect():
+            raise ConnectionError(f"Nao foi possivel conectar no CLP {self.ip}:{self.porta}")
+        try:
+            try:
+                resultado = cliente.write_register(endereco, valor, device_id=device_id)
+            except TypeError:
+                resultado = cliente.write_register(endereco, valor, unit=device_id)
+            if resultado.isError():
+                raise RuntimeError(f"Erro ao escrever registrador {endereco}: {resultado}")
+            return True
+        finally:
+            cliente.close()
+
+    def escrever_coil(self, endereco, estado, device_id=1):
+        """Escreve uma coil por endereco, para teste manual."""
+        endereco, device_id = int(endereco), int(device_id)
+        if not 0 <= endereco <= 65535:
+            raise ValueError("Endereco deve estar entre 0 e 65535")
+        cliente = self._obter_cliente_modbus()
+        if not cliente.connect():
+            raise ConnectionError(f"Nao foi possivel conectar no CLP {self.ip}:{self.porta}")
+        try:
+            try:
+                resultado = cliente.write_coil(endereco, bool(estado), device_id=device_id)
+            except TypeError:
+                resultado = cliente.write_coil(endereco, bool(estado), unit=device_id)
+            if resultado.isError():
+                raise RuntimeError(f"Erro ao escrever coil {endereco}: {resultado}")
+            return True
+        finally:
+            cliente.close()
+
     def resetar_memoria(self, nome_memoria):
         print(f"[CLP] Reset iniciado para {nome_memoria}")
         retorno = self.escrever_memoria(nome_memoria, False)
         print(f"[CLP] Reset {'concluido' if retorno else 'nao concluido'} para {nome_memoria}")
         return retorno
+
+    def parar_esteira(self):
+        """M2100=True intertrava e para a esteira."""
+        return self.escrever_memoria("M2100", True)
+
+    def liberar_esteira(self):
+        """M2100=False libera a esteira depois de uma serial valida."""
+        return self.escrever_memoria("M2100", False)

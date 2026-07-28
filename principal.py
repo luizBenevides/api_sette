@@ -12,9 +12,14 @@ from queue import Queue, Empty
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QApplication,
     QGridLayout,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
     QHBoxLayout,
     QLineEdit,
     QMainWindow,
@@ -23,6 +28,12 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QLabel,
+    QListWidget,
+    QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QFrame,
 )
 from pynput import keyboard
 import time
@@ -31,6 +42,7 @@ from core.memoria import obter_memoria_operacional
 from core.clp import ControladorCLP
 from core.auto_memoria import CicloAutomaticoMemorias
 from core.validacoes_memoria import AvaliadorCasosMemoria
+from core.database import conectar_banco, testar_banco
 
 # Carrega variáveis do arquivo .env
 load_dotenv()
@@ -116,18 +128,18 @@ class SegurancaSette:
 
 class GerenciadorPersistencia:
     def __init__(self):
-        self.db_url = os.getenv("DB_URL")
         self.arquivo_txt = os.getenv("ARQUIVO_EMERGENCIA", "emergencia.txt")
 
     def registrar_log(self, dados_envio, resposta_api, sucesso_api):
         try:
-            conn = psycopg2.connect(self.db_url)
+            conn = conectar_banco()
             cur = conn.cursor()
             query = """
                 INSERT INTO logs_producao 
                 (serial, test_type, jiga_name, resultado, api_response_raw, enviado_api_externa, 
-                 valor_estanqueidade, unidade_medida, programa_teste)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 valor_estanqueidade, unidade_medida, programa_teste,
+                 tratamento_clp, motivo_tratamento)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """
             cur.execute(query, (
                 dados_envio['serial'], 
@@ -138,7 +150,9 @@ class GerenciadorPersistencia:
                 sucesso_api,
                 dados_envio['valor_estanqueidade'],
                 dados_envio['unidade_medida'],
-                dados_envio['programa_teste']
+                dados_envio.get('programa_teste'),
+                dados_envio.get('tratamento_clp'),
+                dados_envio.get('motivo_tratamento')
             ))
             conn.commit()
             cur.close()
@@ -147,6 +161,16 @@ class GerenciadorPersistencia:
         except Exception as e:
             print(f" ERRO BANCO: {e}")
             self.salvar_em_txt(dados_envio, resposta_api, e)
+
+    def registrar_tratamento(self, serial, memoria, motivo):
+        dados = {
+            'serial': serial or 'LEITURA_VAZIA', 'tipo': 'estanque',
+            'jiga': os.getenv('NOME_JIGA'), 'status': 'R',
+            'valor_estanqueidade': None, 'unidade_medida': None,
+            'programa_teste': None, 'tratamento_clp': 'M2100',
+            'motivo_tratamento': f'{memoria}:{motivo}',
+        }
+        self.registrar_log(dados, {'bloqueado': True, 'memoria': 'M2100', 'validacao': memoria, 'motivo': motivo}, False)
 
     def salvar_em_txt(self, dados, resposta, erro_db):
         with open(self.arquivo_txt, "a", encoding="utf-8") as f:
@@ -184,15 +208,16 @@ class ClienteApiSpacecom:
     def __init__(self):
         self.url_base = os.getenv("URL_BASE_SPACECOM")
 
-    def enviar_estanqueidade(self, serial_completo):
+    def enviar_estanqueidade(self, serial_completo, dados_teste=None):
         """Envia dados de estanqueidade para a API externa."""
         endpoint = "/watertightness/log"
         auth = SegurancaSette.gerar_autenticacao("POST", "log")
 
-        valor_envio = os.getenv("VALOR_ESTANQUEIDADE_PADRAO")
-        unidade_envio = os.getenv("UNIDADE_ESTANQUEIDADE_PADRAO")
-        programa_envio = os.getenv("PROGRAMA_TESTE_PADRAO")
-        status_envio = os.getenv("STATUS_PADRAO", "A")
+        dados_teste = dados_teste or {}
+        valor_envio = dados_teste.get("valor_estanqueidade") or os.getenv("VALOR_ESTANQUEIDADE_PADRAO")
+        unidade_envio = dados_teste.get("unidade_medida") or os.getenv("UNIDADE_ESTANQUEIDADE_PADRAO")
+        programa_envio = dados_teste.get("programa_teste") or os.getenv("PROGRAMA_TESTE_PADRAO")
+        status_envio = "A"
 
         if not all([valor_envio, unidade_envio, programa_envio, status_envio]):
             return {
@@ -233,16 +258,214 @@ class ClienteApiSpacecom:
             return {"erro": str(e)}, False, valor_envio, unidade_envio, programa_envio
 
 # --- INTERFACE GRÁFICA ---
+class JanelaEscritaManual(QDialog):
+    """Tela de bancada para escrever pontos Modbus e conferir a IHM do CLP."""
+    def __init__(self, controlador, logger, parent=None):
+        super().__init__(parent)
+        self.controlador, self.logger = controlador, logger
+        self.setWindowTitle("Teste manual de escrita no CLP")
+        self.resize(520, 390)
+        self.tipo = QComboBox(); self.tipo.addItems(["Holding register", "Coil"])
+        self.endereco = QSpinBox(); self.endereco.setRange(0, 65535)
+        self.endereco.setValue(int(os.getenv("CLP_REGISTRADOR_IHM", "0")))
+        self.valor = QSpinBox(); self.valor.setRange(0, 65535)
+        self.device_id = QSpinBox(); self.device_id.setRange(0, 247)
+        self.device_id.setValue(int(os.getenv("CLP_DEVICE_ID", "1")))
+        self.historico = QListWidget()
+        botao = QPushButton("Escrever agora"); botao.clicked.connect(self.escrever)
+        form = QFormLayout(); form.addRow("Area Modbus:", self.tipo)
+        form.addRow("Endereco (base zero):", self.endereco); form.addRow("Valor:", self.valor)
+        form.addRow("Device/Unit ID:", self.device_id)
+        layout = QVBoxLayout(self); layout.addLayout(form); layout.addWidget(botao)
+        layout.addWidget(QLabel("Historico desta sessao:")); layout.addWidget(self.historico)
+        fechar = QDialogButtonBox(QDialogButtonBox.Close); fechar.rejected.connect(self.close); layout.addWidget(fechar)
+
+    def escrever(self):
+        endereco, valor, device_id = self.endereco.value(), self.valor.value(), self.device_id.value()
+        try:
+            if self.tipo.currentText() == "Coil":
+                self.controlador.escrever_coil(endereco, valor != 0, device_id)
+                descricao = f"Coil {endereco} = {1 if valor else 0} (device {device_id})"
+            else:
+                self.controlador.escrever_registrador(endereco, valor, device_id)
+                descricao = f"Holding {endereco} = {valor} (device {device_id})"
+            self.historico.insertItem(0, f"OK - {descricao}"); self.logger(f"[CLP MANUAL] {descricao}")
+        except Exception as erro:
+            self.historico.insertItem(0, f"ERRO - {erro}"); self.logger(f"[CLP MANUAL] erro: {erro}")
+
+
+TRATAMENTOS_POPUP = {
+    "M130": ("SERIAL SEM INTEGRACAO", "Leia uma serial valida para liberar a esteira."),
+    "M131": ("PRODUTO JA APROVADO", "Produto aprovado ou finalizado. Leia a proxima serial valida."),
+    "M132": ("RETESTE BLOQUEADO", "Aguarde o intervalo minimo de 30 minutos."),
+    "M133": ("LIMITE DE RETESTES", "Produto reprovado duas vezes. Retire a peca da linha."),
+}
+
+
+class PopupTratamento(QDialog):
+    def __init__(self, memoria, parent=None):
+        super().__init__(parent)
+        titulo, mensagem = TRATAMENTOS_POPUP[memoria]
+        self.setWindowTitle(titulo); self.setModal(False)
+        self.setWindowFlag(Qt.WindowCloseButtonHint, False); self.setMinimumSize(760, 420)
+        self.setStyleSheet("QDialog { background:#9b111e; } QLabel { color:white; }")
+        cabecalho = QLabel(titulo); cabecalho.setAlignment(Qt.AlignCenter)
+        cabecalho.setStyleSheet("font-size:38px; font-weight:bold;")
+        texto = QLabel(mensagem + "\\n\\nESTEIRA PARADA - M2100 = TRUE")
+        texto.setWordWrap(True); texto.setAlignment(Qt.AlignCenter)
+        texto.setStyleSheet("font-size:25px; font-weight:bold;")
+        layout = QVBoxLayout(self); layout.addStretch(); layout.addWidget(cabecalho)
+        layout.addWidget(texto); layout.addStretch()
+
+
+class DashboardSeriais(QDialog):
+    """Dashboard industrial no mesmo padrao visual dos demais softwares SETTE."""
+    CORES_LED = {"vermelho": "#ef4444", "verde": "#4ade80", "amarelo": "#facc15"}
+
+    def __init__(self, conectar_clp, parent=None):
+        super().__init__(parent)
+        self.conectar_clp = conectar_clp
+        self.total = 0
+        self.aprovadas = 0
+        self.tratamentos = 0
+        self.setWindowTitle("SETTE | Dashboard de Coleta")
+        self.resize(1440, 850)
+        self.setMinimumSize(1080, 680)
+        self.setStyleSheet("""
+            QDialog { background:#08090f; color:#f8fafc; }
+            QLabel { color:#f8fafc; }
+            QPushButton { background:#242633; color:#d1d5db; border:1px solid #343746;
+                          border-radius:5px; padding:10px 18px; font-size:14px; font-weight:600; }
+            QPushButton:hover { background:#303341; border-color:#60a5fa; color:white; }
+            QPushButton:pressed { background:#1d4ed8; }
+            QTableWidget { background:#20222d; alternate-background-color:#242733; color:#e5e7eb;
+                           border:0; gridline-color:#30333f; selection-background-color:#334155;
+                           font-size:14px; }
+            QHeaderView::section { background:#1b1d27; color:#9ca3af; border:0;
+                                   border-bottom:1px solid #343746; padding:12px; font-weight:700; }
+            QTableCornerButton::section { background:#1b1d27; border:0; }
+            QScrollBar:vertical { background:#171923; width:12px; }
+            QScrollBar::handle:vertical { background:#3b3f50; border-radius:6px; min-height:28px; }
+        """)
+
+        marca = QLabel("SETTE  /  COLETA DE SERIAIS")
+        marca.setStyleSheet("font-size:13px; color:#64748b; font-weight:700; letter-spacing:1px;")
+        titulo = QLabel("Dashboard de Produção")
+        titulo.setStyleSheet("font-size:30px; font-weight:700; color:#f8fafc;")
+        bloco_titulo = QVBoxLayout(); bloco_titulo.setSpacing(3)
+        bloco_titulo.addWidget(marca); bloco_titulo.addWidget(titulo)
+
+        self.led = QLabel(); self.led.setFixedSize(22, 22)
+        self.texto_clp = QLabel("CLP desconectado")
+        self.texto_clp.setStyleSheet("font-size:15px; font-weight:700;")
+        self.btn_conectar = QPushButton("Conectar com o CLP")
+        self.btn_conectar.clicked.connect(self._conectar)
+        topo = QHBoxLayout(); topo.setContentsMargins(8, 4, 8, 8)
+        topo.addLayout(bloco_titulo); topo.addStretch()
+        topo.addWidget(self.led); topo.addWidget(self.texto_clp); topo.addSpacing(10); topo.addWidget(self.btn_conectar)
+
+        card_aprovado, self.lbl_aprovadas, self.lbl_pct_aprovadas = self._criar_card(
+            "APROVADAS", "#172920", "#4ade80", "peças aprovadas")
+        card_tratamento, self.lbl_tratamentos, self.lbl_pct_tratamentos = self._criar_card(
+            "EM TRATAMENTO", "#302021", "#f87171", "esteira interrompida")
+        card_total, self.lbl_total, self.lbl_pct_total = self._criar_card(
+            "TOTAL", "#1d2533", "#60a5fa", "seriais coletadas")
+        cards = QHBoxLayout(); cards.setSpacing(14)
+        cards.addWidget(card_aprovado); cards.addWidget(card_tratamento); cards.addWidget(card_total)
+
+        titulo_tabela = QLabel("SERIAIS GRAVADAS")
+        titulo_tabela.setStyleSheet("font-size:14px; color:#94a3b8; font-weight:700; padding:4px;")
+        self.tabela = QTableWidget(0, 5)
+        self.tabela.setHorizontalHeaderLabels(["DATA / HORA", "SERIAL", "ENVIO INICIAL", "VALIDAÇÃO", "MOTIVO"])
+        self.tabela.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.tabela.setSelectionBehavior(QTableWidget.SelectRows)
+        self.tabela.setAlternatingRowColors(True)
+        self.tabela.setShowGrid(False)
+        self.tabela.verticalHeader().setVisible(False)
+        self.tabela.verticalHeader().setDefaultSectionSize(42)
+        cabecalho = self.tabela.horizontalHeader()
+        for coluna in range(4):
+            cabecalho.setSectionResizeMode(coluna, QHeaderView.ResizeToContents)
+        cabecalho.setSectionResizeMode(4, QHeaderView.Stretch)
+
+        painel_tabela = QFrame(); painel_tabela.setObjectName("painelTabela")
+        painel_tabela.setStyleSheet("QFrame#painelTabela { background:#1f212b; border-radius:5px; }")
+        layout_tabela = QVBoxLayout(painel_tabela); layout_tabela.setContentsMargins(18, 16, 18, 18)
+        layout_tabela.addWidget(titulo_tabela); layout_tabela.addWidget(self.tabela)
+
+        layout = QVBoxLayout(self); layout.setContentsMargins(24, 20, 24, 22); layout.setSpacing(14)
+        layout.addLayout(topo); layout.addLayout(cards, 4); layout.addWidget(painel_tabela, 3)
+        self.definir_estado("vermelho", "CLP desconectado")
+
+    def _criar_card(self, titulo, fundo, destaque, legenda):
+        card = QFrame(); card.setMinimumHeight(230)
+        card.setStyleSheet(f"QFrame {{ background:{fundo}; border-radius:4px; }}")
+        lbl_titulo = QLabel(titulo); lbl_titulo.setAlignment(Qt.AlignCenter)
+        lbl_titulo.setStyleSheet("font-size:22px; font-weight:600; color:#f8fafc;")
+        numero = QLabel("0"); numero.setAlignment(Qt.AlignCenter)
+        numero.setStyleSheet(f"font-size:78px; font-weight:700; color:{destaque};")
+        lbl_legenda = QLabel(legenda); lbl_legenda.setAlignment(Qt.AlignCenter)
+        lbl_legenda.setStyleSheet("font-size:15px; color:#7c8393;")
+        percentual = QLabel("0%"); percentual.setAlignment(Qt.AlignCenter)
+        percentual.setStyleSheet("font-size:17px; font-weight:700; color:#f8fafc;")
+        box = QVBoxLayout(card); box.setContentsMargins(18, 24, 18, 22)
+        box.addWidget(lbl_titulo); box.addStretch(); box.addWidget(numero)
+        box.addWidget(lbl_legenda); box.addWidget(percentual); box.addStretch()
+        return card, numero, percentual
+
+    def definir_estado(self, cor, texto):
+        cor_css = self.CORES_LED[cor]
+        self.led.setStyleSheet(f"background:{cor_css}; border-radius:11px; border:2px solid #475569;")
+        self.texto_clp.setText(texto)
+
+    def _conectar(self):
+        self.btn_conectar.setEnabled(False); self.btn_conectar.setText("Conectando...")
+        try:
+            conectado = bool(self.conectar_clp())
+            self.definir_estado("verde" if conectado else "vermelho", "CLP conectado" if conectado else "CLP desconectado")
+        finally:
+            self.btn_conectar.setText("Conectar com o CLP"); self.btn_conectar.setEnabled(True)
+
+    def _atualizar_indicadores(self):
+        self.lbl_aprovadas.setText(str(self.aprovadas))
+        self.lbl_tratamentos.setText(str(self.tratamentos))
+        self.lbl_total.setText(str(self.total))
+        pct_aprovadas = (self.aprovadas / self.total * 100) if self.total else 0
+        pct_tratamentos = (self.tratamentos / self.total * 100) if self.total else 0
+        self.lbl_pct_aprovadas.setText(f"{pct_aprovadas:.0f}%")
+        self.lbl_pct_tratamentos.setText(f"{pct_tratamentos:.0f}%")
+        self.lbl_pct_total.setText("100%" if self.total else "0%")
+
+    def registrar_leitura(self, serial, status, validacao="-", motivo="-"):
+        em_tratamento = validacao != "-"
+        self.total += 1
+        if em_tratamento: self.tratamentos += 1
+        else: self.aprovadas += 1
+        self._atualizar_indicadores()
+
+        self.tabela.insertRow(0)
+        valores = [datetime.now().strftime("%d/%m/%Y %H:%M:%S"), serial or "(vazia)", status, validacao, motivo]
+        fundo = QColor("#352f22" if em_tratamento else "#1d2b25")
+        texto = QColor("#fde68a" if em_tratamento else "#d1fae5")
+        for coluna, valor in enumerate(valores):
+            item = QTableWidgetItem(str(valor)); item.setBackground(fundo); item.setForeground(texto)
+            self.tabela.setItem(0, coluna, item)
+        if self.tabela.rowCount() > 1000:
+            self.tabela.removeRow(self.tabela.rowCount() - 1)
+
+
 class InterfaceApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("SETTE - Integrador (Global)")
-        self.setFixedSize(820, 520)
+        self.resize(900, 650)
         self.memoria_operacional = obter_memoria_operacional()
         self.controlador_clp = ControladorCLP()
         self.ciclo_auto_memoria = CicloAutomaticoMemorias()
         self.avaliador_casos = AvaliadorCasosMemoria()
         self.memoria_auto_alvo = None
+        self.popup_tratamento = None
+        self.dashboard = None
         
         self.api = ClienteApiSpacecom()
         self.dados = GerenciadorPersistencia()
@@ -252,11 +475,12 @@ class InterfaceApp(QMainWindow):
         self.thread_worker = threading.Thread(target=self.processar_fila_worker, daemon=True)
         self.thread_worker.start()
         
-        # Inicializa o ouvinte global
+        self.configurar_ui()
+        self.dashboard = DashboardSeriais(self.testar_conexao_clp, self)
+
+        # Inicializa o ouvinte global somente depois de todas as telas estarem prontas.
         self.ouvinte = OuvinteGlobal()
         self.ouvinte.serial_capturado.connect(self.validar_e_processar)
-
-        self.configurar_ui()
 
     def configurar_ui(self):
         layout = QVBoxLayout()
@@ -280,41 +504,41 @@ class InterfaceApp(QMainWindow):
         topo.addWidget(QLabel("Porta:"), 0, 2)
         topo.addWidget(self.input_porta_clp, 0, 3)
 
-        self.status_memoria = QLabel("Memorias prontas para teste: M130, M131, M132, M133")
+        self.status_memoria = QLabel("Intertravamento da esteira: somente M2100")
         self.status_memoria.setStyleSheet("color: #444;")
         if self.ciclo_auto_memoria.habilitado():
             self.status_memoria.setText("Modo automatico de memorias ATIVO")
 
         botoes_memoria = QGridLayout()
-        self.btn_m130 = QPushButton("Acionar M130 - Serial sem integracao")
-        self.btn_m131 = QPushButton("Acionar M131 - Produto aprovado/finalizado")
-        self.btn_m132 = QPushButton("Acionar M132 - Reteste apos 30 min")
-        self.btn_m133 = QPushButton("Acionar M133 - 2 testes reprovados")
+        self.btn_m130 = QPushButton("Simular: Serial sem integracao")
+        self.btn_m131 = QPushButton("Simular: Produto aprovado/finalizado")
+        self.btn_m132 = QPushButton("Simular: Reteste antes de 30 min")
+        self.btn_m133 = QPushButton("Simular: 2 testes reprovados")
         self.btn_testar_clp = QPushButton("Testar conexao CLP")
-        self.btn_reset_m130 = QPushButton("Reset M130")
-        self.btn_reset_m131 = QPushButton("Reset M131")
-        self.btn_reset_m132 = QPushButton("Reset M132")
-        self.btn_reset_m133 = QPushButton("Reset M133")
+        self.btn_testar_banco = QPushButton("Testar conexao banco")
+        self.btn_escrita_manual = QPushButton("Abrir escrita manual de registradores")
+        self.btn_dashboard = QPushButton("Abrir dashboard de seriais")
+        self.btn_dashboard.setStyleSheet("font-size:16px; font-weight:bold; min-height:38px;")
+        self.btn_liberar_m2100 = QPushButton("Teste manual: liberar esteira (M2100=False)")
 
-        self.btn_m130.clicked.connect(lambda: self.acionar_memoria_clp("M130"))
-        self.btn_m131.clicked.connect(lambda: self.acionar_memoria_clp("M131"))
-        self.btn_m132.clicked.connect(lambda: self.acionar_memoria_clp("M132"))
-        self.btn_m133.clicked.connect(lambda: self.acionar_memoria_clp("M133"))
+        self.btn_m130.clicked.connect(lambda: self.parar_esteira_e_exibir("M130"))
+        self.btn_m131.clicked.connect(lambda: self.parar_esteira_e_exibir("M131"))
+        self.btn_m132.clicked.connect(lambda: self.parar_esteira_e_exibir("M132"))
+        self.btn_m133.clicked.connect(lambda: self.parar_esteira_e_exibir("M133"))
         self.btn_testar_clp.clicked.connect(self.testar_conexao_clp)
-        self.btn_reset_m130.clicked.connect(lambda: self.resetar_memoria_clp("M130"))
-        self.btn_reset_m131.clicked.connect(lambda: self.resetar_memoria_clp("M131"))
-        self.btn_reset_m132.clicked.connect(lambda: self.resetar_memoria_clp("M132"))
-        self.btn_reset_m133.clicked.connect(lambda: self.resetar_memoria_clp("M133"))
+        self.btn_testar_banco.clicked.connect(self.testar_conexao_banco)
+        self.btn_escrita_manual.clicked.connect(self.abrir_escrita_manual)
+        self.btn_dashboard.clicked.connect(self.abrir_dashboard)
+        self.btn_liberar_m2100.clicked.connect(self.liberar_esteira_teste_manual)
 
         botoes_memoria.addWidget(self.btn_m130, 0, 0)
         botoes_memoria.addWidget(self.btn_m131, 0, 1)
         botoes_memoria.addWidget(self.btn_m132, 1, 0)
         botoes_memoria.addWidget(self.btn_m133, 1, 1)
         botoes_memoria.addWidget(self.btn_testar_clp, 2, 0, 1, 2)
-        botoes_memoria.addWidget(self.btn_reset_m130, 3, 0)
-        botoes_memoria.addWidget(self.btn_reset_m131, 3, 1)
-        botoes_memoria.addWidget(self.btn_reset_m132, 4, 0)
-        botoes_memoria.addWidget(self.btn_reset_m133, 4, 1)
+        botoes_memoria.addWidget(self.btn_testar_banco, 3, 0, 1, 2)
+        botoes_memoria.addWidget(self.btn_escrita_manual, 4, 0, 1, 2)
+        botoes_memoria.addWidget(self.btn_liberar_m2100, 5, 0, 1, 2)
         
         self.terminal = QTextEdit()
         self.terminal.setReadOnly(True)
@@ -322,6 +546,7 @@ class InterfaceApp(QMainWindow):
         
         layout.addWidget(self.label_clp)
         layout.addLayout(topo)
+        layout.addWidget(self.btn_dashboard)
         layout.addWidget(self.label_status)
         layout.addWidget(self.status_memoria)
         layout.addLayout(botoes_memoria)
@@ -347,9 +572,75 @@ class InterfaceApp(QMainWindow):
             conectado = self.controlador_clp.testar_conexao()
             self.status_memoria.setText(f"Conexao CLP: {'OK' if conectado else 'FALHA'}")
             self.log_terminal(f"[CLP] teste de conexao {'OK' if conectado else 'FALHA'}")
+            return conectado
         except Exception as erro:
             self.status_memoria.setText("Conexao CLP: ERRO")
             self.log_terminal(f"[CLP] erro no teste de conexao: {erro}")
+            return False
+
+    def abrir_dashboard(self):
+        self.dashboard.showMaximized(); self.dashboard.raise_(); self.dashboard.activateWindow()
+
+    def testar_conexao_banco(self):
+        try:
+            conectado = testar_banco()
+            self.label_status.setText("BANCO DE DADOS CONECTADO" if conectado else "FALHA NO BANCO")
+            self.log_terminal(f"[DB] teste de conexao {'OK' if conectado else 'FALHA'}")
+        except Exception as erro:
+            self.label_status.setText("ERRO NA CONEXAO COM BANCO")
+            self.log_terminal(f"[DB] erro no teste: {erro}")
+
+    def abrir_escrita_manual(self):
+        self.atualizar_config_clp()
+        JanelaEscritaManual(self.controlador_clp, self.log_terminal, self).exec()
+
+    def parar_esteira_e_exibir(self, memoria):
+        self.atualizar_config_clp()
+        m2100_acionada = False
+        try:
+            self.controlador_clp.parar_esteira()
+            m2100_acionada = True
+            self.status_memoria.setText(f"ESTEIRA PARADA: M2100=TRUE ({memoria})")
+            self.log_terminal(f"[SEGURANCA] M2100 ligada pelo tratamento {memoria}")
+        except Exception as erro:
+            self.log_terminal(f"[SEGURANCA] ERRO CRITICO ao ligar M2100: {erro}")
+        if self.popup_tratamento is not None:
+            self.popup_tratamento.close()
+        self.popup_tratamento = PopupTratamento(memoria, self)
+        self.popup_tratamento.show(); self.popup_tratamento.raise_(); self.popup_tratamento.activateWindow()
+        if self.dashboard is not None:
+            if m2100_acionada:
+                self.dashboard.definir_estado("amarelo", f"TRATAMENTO ATIVO - {memoria} - M2100=True")
+            else:
+                self.dashboard.definir_estado("vermelho", "CLP desconectado - falha ao acionar M2100")
+
+    def liberar_esteira_por_serial_valida(self, serial):
+        self.atualizar_config_clp()
+        try:
+            self.controlador_clp.liberar_esteira()
+            self.status_memoria.setText("ESTEIRA LIBERADA: M2100=FALSE")
+            self.log_terminal(f"[SEGURANCA] Serial valida {serial}: M2100 desligada")
+            if self.popup_tratamento is not None:
+                self.popup_tratamento.close(); self.popup_tratamento = None
+            if self.dashboard is not None:
+                self.dashboard.definir_estado("verde", "CLP conectado - esteira liberada")
+            return True
+        except Exception as erro:
+            self.log_terminal(f"[SEGURANCA] Nao foi possivel liberar M2100: {erro}")
+            return False
+
+    def liberar_esteira_teste_manual(self):
+        self.atualizar_config_clp()
+        try:
+            self.controlador_clp.liberar_esteira()
+            self.status_memoria.setText("TESTE MANUAL: M2100=FALSE")
+            self.log_terminal("[CLP TESTE] M2100 desligada manualmente")
+            if self.popup_tratamento is not None:
+                self.popup_tratamento.close(); self.popup_tratamento = None
+            if self.dashboard is not None:
+                self.dashboard.definir_estado("verde", "CLP conectado - liberacao manual")
+        except Exception as erro:
+            self.log_terminal(f"[CLP TESTE] erro ao desligar M2100: {erro}")
 
     def acionar_memoria_clp(self, memoria):
         self.atualizar_config_clp()
@@ -395,21 +686,25 @@ class InterfaceApp(QMainWindow):
                 self.log_terminal(f"[VALIDACAO] Serial {serial} caiu no caso {motivo} -> {memoria_bloqueio}")
 
             # 2) Processa o CLP apenas uma vez (seja para resetar o anterior ou para aplicar novo bloqueio)
-            bloqueado = self.ciclo_auto_memoria.processar_serial(
-                serial,
-                self.controlador_clp,
-                self.log_terminal,
-                memoria_alvo=memoria_bloqueio,
-            )
-
-            if bloqueado:
-                self.log_terminal(f"[VALIDACAO] Fluxo bloqueado para serial {serial} por {memoria_bloqueio}")
+            if memoria_bloqueio:
+                self.dados.registrar_tratamento(serial, memoria_bloqueio, motivo)
+                self.dashboard.registrar_leitura(serial, "BLOQUEADA", memoria_bloqueio, motivo)
+                self.parar_esteira_e_exibir(memoria_bloqueio)
+                self.log_terminal(f"[VALIDACAO] Fluxo bloqueado por {memoria_bloqueio}; CLP M2100=TRUE")
                 return
+            if not self.liberar_esteira_por_serial_valida(serial):
+                self.dashboard.registrar_leitura(serial, "NAO ENVIADA", "FALHA CLP", "Nao foi possivel liberar M2100")
+                return
+
+            self.dashboard.registrar_leitura(serial, "APROVADA (A)")
 
             self.fila_serial.enfileirar(serial)
             self.fila_eventos.put("processar")
         else:
             self.log_terminal(f"Leitura ignorada (fora do padrão 10): {serial}")
+            self.dados.registrar_tratamento(serial, "M130", "serial_sem_integracao")
+            self.dashboard.registrar_leitura(serial, "BLOQUEADA", "M130", "serial_sem_integracao")
+            self.parar_esteira_e_exibir("M130")
 
     def processar_fila_worker(self):
         while True:
@@ -446,10 +741,12 @@ class InterfaceApp(QMainWindow):
             'serial': serial, 
             'tipo': 'estanque',
             'jiga': os.getenv("NOME_JIGA"), 
-            'status': 'A' if sucesso else 'R',
+            'status': 'A',
             'valor_estanqueidade': v_est,
             'unidade_medida': v_uni,
             'programa_teste': v_prog
+            ,'tratamento_clp': None
+            ,'motivo_tratamento': None
         }
         
         try:

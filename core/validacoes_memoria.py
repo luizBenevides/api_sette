@@ -5,21 +5,18 @@ import os
 import re
 
 import psycopg2
+from core.database import conectar_banco
 
 
 class AvaliadorCasosMemoria:
     def __init__(self):
-        self.db_url = os.getenv("DB_URL", "")
         self.minutos_reteste = int(os.getenv("RETESTE_MINUTOS_MINIMO", "30"))
 
     def _serial_valida(self, serial_lido):
         return bool(re.fullmatch(r"\d{10}", serial_lido or ""))
 
     def _buscar_historico(self, serial_lido):
-        if not self.db_url:
-            return []
-
-        conn = psycopg2.connect(self.db_url)
+        conn = conectar_banco()
         try:
             cur = conn.cursor()
             cur.execute(
@@ -27,6 +24,7 @@ class AvaliadorCasosMemoria:
                 SELECT resultado, criado_em
                 FROM logs_producao
                 WHERE serial = %s
+                  AND tratamento_clp IS NULL
                 ORDER BY criado_em DESC
                 LIMIT 50
                 """,
