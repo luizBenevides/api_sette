@@ -187,14 +187,64 @@ class GerenciadorPersistencia:
             self.salvar_em_txt(dados_envio, resposta_api, e)
 
     def registrar_tratamento(self, serial, memoria, motivo):
-        dados = {
-            'serial': serial or 'LEITURA_VAZIA', 'tipo': 'estanque',
-            'jiga': os.getenv('NOME_JIGA'), 'status': 'R',
-            'valor_estanqueidade': None, 'unidade_medida': None,
-            'programa_teste': None, 'tratamento_clp': 'M2100',
-            'motivo_tratamento': f'{memoria}:{motivo}',
-        }
-        self.registrar_log(dados, {'bloqueado': True, 'memoria': 'M2100', 'validacao': memoria, 'motivo': motivo}, False)
+        serial = serial or 'LEITURA_VAZIA'
+        motivo_completo = f'{memoria}:{motivo}'
+        resposta = {'bloqueado': True, 'memoria': 'M2100', 'validacao': memoria, 'motivo': motivo}
+        conn = None
+        try:
+            conn = conectar_banco()
+            with conn.cursor() as cur:
+                chave_lock = f"TRATAMENTO|{serial}|{motivo_completo}"
+                cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (chave_lock,))
+                cur.execute(
+                    """
+                    SELECT id FROM logs_producao
+                    WHERE serial = %s AND tratamento_clp = 'M2100'
+                      AND motivo_tratamento = %s
+                    ORDER BY id ASC LIMIT 1 FOR UPDATE
+                    """,
+                    (serial, motivo_completo),
+                )
+                existente = cur.fetchone()
+                if existente:
+                    cur.execute(
+                        """
+                        UPDATE logs_producao
+                           SET criado_em = CURRENT_TIMESTAMP,
+                               resultado = 'R', enviado_api_externa = FALSE,
+                               api_response_raw = %s, jiga_name = %s
+                         WHERE id = %s
+                        """,
+                        (json.dumps(resposta), os.getenv('NOME_JIGA'), existente[0]),
+                    )
+                    conn.commit()
+                    print(f"[DB] Tratamento existente atualizado: id={existente[0]} serial={serial} erro={memoria}")
+                    return existente[0]
+
+                cur.execute(
+                    """
+                    INSERT INTO logs_producao
+                    (serial, test_type, jiga_name, resultado, api_response_raw,
+                     enviado_api_externa, tratamento_clp, motivo_tratamento)
+                    VALUES (%s, 'estanque', %s, 'R', %s, FALSE, 'M2100', %s)
+                    RETURNING id
+                    """,
+                    (serial, os.getenv('NOME_JIGA'), json.dumps(resposta), motivo_completo),
+                )
+                novo_id = cur.fetchone()[0]
+                conn.commit()
+                print(f"[DB] Primeiro registro do tratamento: id={novo_id} serial={serial} erro={memoria}")
+                return novo_id
+        except Exception as erro:
+            if conn is not None:
+                conn.rollback()
+            dados = {'serial': serial, 'tratamento_clp': 'M2100', 'motivo_tratamento': motivo_completo}
+            print(f"[DB] Erro ao gravar/atualizar tratamento: {erro}")
+            self.salvar_em_txt(dados, resposta, erro)
+            return None
+        finally:
+            if conn is not None:
+                conn.close()
 
     def carregar_ultimos_estados(self):
         """Retorna somente o evento mais recente de cada serial."""
