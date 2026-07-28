@@ -15,8 +15,7 @@ if not exist "%APP%" (
 cd /d "%PROJECT_DIR%"
 
 echo Reiniciando o integrador SETTE...
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
-  "Get-CimInstance Win32_Process ^| Where-Object { $_.CommandLine -like '*api_sette*' -and $_.CommandLine -like '*principal.py*' } ^| ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+taskkill /F /FI "IMAGENAME eq pythonw.exe" /FI "WINDOWTITLE eq SETTE*" >nul 2>&1
 
 timeout /t 1 /nobreak >nul
 del /q "%TEMP%\\sette_integrador_instancia.lock" >nul 2>&1
