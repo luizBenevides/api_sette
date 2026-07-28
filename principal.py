@@ -770,5 +770,9 @@ class InterfaceApp(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = InterfaceApp()
-    window.show()
+    if "--dashboard" in sys.argv:
+        window.dashboard.setWindowFlag(Qt.Window, True)
+        window.dashboard.showMaximized()
+    else:
+        window.show()
     sys.exit(app.exec())
