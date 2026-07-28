@@ -11,7 +11,7 @@ from collections import deque
 from queue import Queue, Empty
 from datetime import datetime, timezone
 from dotenv import load_dotenv
-from PySide6.QtCore import Qt, QTimer, Signal, QObject
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QLockFile
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QApplication,
@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QHeaderView,
     QFrame,
+    QMessageBox,
 )
 from pynput import keyboard
 import time
@@ -221,7 +222,7 @@ class ClienteApiSpacecom:
 
         if not all([valor_envio, unidade_envio, programa_envio, status_envio]):
             return {
-                "erro": "Dados de envio incompletos no .env. Configure VALOR_ESTANQUEIDADE_PADRAO, UNIDADE_ESTANQUEIDADE_PADRAO, PROGRAMA_TESTE_PADRAO e STATUS_PADRAO."
+                "erro": "Dados de envio incompletos no .env. Configure VALOR_ESTANQUEIDADE_PADRAO, UNIDADE_ESTANQUEIDADE_PADRAO e PROGRAMA_TESTE_PADRAO."
             }, False, valor_envio, unidade_envio, programa_envio
 
         payload = {
@@ -311,7 +312,7 @@ class PopupTratamento(QDialog):
         self.setStyleSheet("QDialog { background:#9b111e; } QLabel { color:white; }")
         cabecalho = QLabel(titulo); cabecalho.setAlignment(Qt.AlignCenter)
         cabecalho.setStyleSheet("font-size:38px; font-weight:bold;")
-        texto = QLabel(mensagem + "\\n\\nESTEIRA PARADA - M2100 = TRUE")
+        texto = QLabel(mensagem + "\n\nESTEIRA PARADA")
         texto.setWordWrap(True); texto.setAlignment(Qt.AlignCenter)
         texto.setStyleSheet("font-size:25px; font-weight:bold;")
         layout = QVBoxLayout(self); layout.addStretch(); layout.addWidget(cabecalho)
@@ -466,6 +467,9 @@ class InterfaceApp(QMainWindow):
         self.memoria_auto_alvo = None
         self.popup_tratamento = None
         self.dashboard = None
+        self.ultima_serial_capturada = None
+        self.ultima_serial_capturada_em = 0.0
+        self.debounce_serial_seg = float(os.getenv("SERIAL_DEBOUNCE_SEG", "2"))
         
         self.api = ClienteApiSpacecom()
         self.dados = GerenciadorPersistencia()
@@ -677,6 +681,12 @@ class InterfaceApp(QMainWindow):
 
     def validar_e_processar(self, serial_recebido):
         serial = serial_recebido.strip()
+        agora = time.monotonic()
+        if serial and serial == self.ultima_serial_capturada and (agora - self.ultima_serial_capturada_em) < self.debounce_serial_seg:
+            self.log_terminal(f"[LEITOR] Duplicata imediata ignorada: {serial}")
+            return
+        self.ultima_serial_capturada = serial
+        self.ultima_serial_capturada_em = agora
         if SegurancaSette.validar_serial(serial):
             self.log_terminal(f"Serial Lido: {serial}")
 
@@ -769,6 +779,12 @@ class InterfaceApp(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    caminho_lock = os.path.join(os.getenv("TEMP", os.getcwd()), "sette_integrador_instancia.lock")
+    lock_instancia = QLockFile(caminho_lock)
+    lock_instancia.setStaleLockTime(10000)
+    if not lock_instancia.tryLock(0):
+        QMessageBox.warning(None, "SETTE ja esta aberto", "O integrador SETTE ja esta em execucao neste computador.")
+        sys.exit(2)
     window = InterfaceApp()
     if "--dashboard" in sys.argv:
         window.dashboard.setWindowFlag(Qt.Window, True)
