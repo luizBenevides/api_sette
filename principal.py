@@ -212,10 +212,11 @@ class GerenciadorPersistencia:
                         UPDATE logs_producao
                            SET criado_em = CURRENT_TIMESTAMP,
                                resultado = 'R', enviado_api_externa = FALSE,
-                               api_response_raw = %s, jiga_name = %s
+                               api_response_raw = NULL, causa_falha = %s,
+                               jiga_name = %s
                          WHERE id = %s
                         """,
-                        (json.dumps(resposta), os.getenv('NOME_JIGA'), existente[0]),
+                        (memoria, os.getenv('NOME_JIGA'), existente[0]),
                     )
                     conn.commit()
                     print(f"[DB] Tratamento existente atualizado: id={existente[0]} serial={serial} erro={memoria}")
@@ -224,12 +225,12 @@ class GerenciadorPersistencia:
                 cur.execute(
                     """
                     INSERT INTO logs_producao
-                    (serial, test_type, jiga_name, resultado, api_response_raw,
-                     enviado_api_externa, tratamento_clp, motivo_tratamento)
-                    VALUES (%s, 'estanque', %s, 'R', %s, FALSE, 'M2100', %s)
+                    (serial, test_type, jiga_name, resultado, causa_falha,
+                     api_response_raw, enviado_api_externa, tratamento_clp, motivo_tratamento)
+                    VALUES (%s, 'estanque', %s, 'R', %s, NULL, FALSE, 'M2100', %s)
                     RETURNING id
                     """,
-                    (serial, os.getenv('NOME_JIGA'), json.dumps(resposta), motivo_completo),
+                    (serial, os.getenv('NOME_JIGA'), memoria, motivo_completo),
                 )
                 novo_id = cur.fetchone()[0]
                 conn.commit()
