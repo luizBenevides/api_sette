@@ -248,16 +248,31 @@ class GerenciadorPersistencia:
                 conn.close()
 
     def carregar_ultimos_estados(self):
-        """Retorna somente o evento mais recente de cada serial."""
+        """Consolida aprovacao e ultimo tratamento de cada serial."""
         conn = conectar_banco()
         try:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT DISTINCT ON (serial)
-                           criado_em, serial, resultado, tratamento_clp, motivo_tratamento
-                    FROM logs_producao
-                    WHERE serial IS NOT NULL AND TRIM(serial) <> ''
-                    ORDER BY serial, criado_em DESC, id DESC
+                    WITH resumo AS (
+                        SELECT serial,
+                               MAX(criado_em) AS ultima_leitura,
+                               BOOL_OR(resultado = 'A' AND tratamento_clp IS NULL) AS aprovada
+                        FROM logs_producao
+                        WHERE serial IS NOT NULL AND TRIM(serial) <> ''
+                        GROUP BY serial
+                    ), ultimo_tratamento AS (
+                        SELECT DISTINCT ON (serial)
+                               serial, causa_falha, motivo_tratamento
+                        FROM logs_producao
+                        WHERE tratamento_clp = 'M2100'
+                        ORDER BY serial, criado_em DESC, id DESC
+                    )
+                    SELECT resumo.ultima_leitura, resumo.serial, resumo.aprovada,
+                           ultimo_tratamento.causa_falha,
+                           ultimo_tratamento.motivo_tratamento
+                    FROM resumo
+                    LEFT JOIN ultimo_tratamento USING (serial)
+                    ORDER BY resumo.ultima_leitura DESC
                 """)
                 return cur.fetchall()
         finally:
@@ -520,8 +535,8 @@ class DashboardSeriais(QDialog):
 
     def _atualizar_indicadores(self):
         self.total = len(self.registros_por_serial)
-        self.aprovadas = sum(1 for registro in self.registros_por_serial.values() if registro["validacao"] == "-")
-        self.tratamentos = self.total - self.aprovadas
+        self.aprovadas = sum(1 for registro in self.registros_por_serial.values() if registro["aprovada"])
+        self.tratamentos = sum(1 for registro in self.registros_por_serial.values() if registro["validacao"] != "-")
         self.lbl_aprovadas.setText(str(self.aprovadas))
         self.lbl_tratamentos.setText(str(self.tratamentos))
         self.lbl_total.setText(str(self.total))
@@ -533,24 +548,29 @@ class DashboardSeriais(QDialog):
 
     def registrar_leitura(self, serial, status, validacao="-", motivo="-", horario=None):
         chave = (serial or "(vazia)").strip()
+        anterior = self.registros_por_serial.get(chave, {})
+        aprovada = anterior.get("aprovada", False) or status.startswith("APROVADA")
         self.registros_por_serial[chave] = {
             "horario": horario or datetime.now(), "serial": chave, "status": status,
-            "validacao": validacao or "-", "motivo": motivo or "-",
+            "validacao": validacao or anterior.get("validacao", "-"),
+            "motivo": motivo or anterior.get("motivo", "-"), "aprovada": aprovada,
         }
+        if aprovada:
+            self.registros_por_serial[chave]["status"] = "APROVADA (A)"
         self._renderizar_registros()
 
     def carregar_do_banco(self, registros):
         self.registros_por_serial.clear()
-        for criado_em, serial, resultado, tratamento_clp, motivo_tratamento in registros:
+        for criado_em, serial, aprovada, causa_falha, motivo_tratamento in registros:
             motivo = motivo_tratamento or "-"
-            validacao = "-"
-            if tratamento_clp:
-                validacao = motivo.split(":", 1)[0] if ":" in motivo else tratamento_clp
+            validacao = causa_falha or "-"
+            if motivo_tratamento:
+                validacao = causa_falha or (motivo.split(":", 1)[0] if ":" in motivo else "M2100")
                 motivo = motivo.split(":", 1)[1] if ":" in motivo else motivo
             self.registros_por_serial[str(serial).strip()] = {
                 "horario": criado_em, "serial": str(serial).strip(),
-                "status": "BLOQUEADA" if tratamento_clp else "APROVADA (A)",
-                "validacao": validacao, "motivo": motivo,
+                "status": "APROVADA (A)" if aprovada else "BLOQUEADA",
+                "validacao": validacao, "motivo": motivo, "aprovada": bool(aprovada),
             }
         self._renderizar_registros()
 
@@ -603,6 +623,10 @@ class InterfaceApp(QMainWindow):
         self.configurar_ui()
         self.dashboard = DashboardSeriais(self.testar_conexao_clp, self)
         self.carregar_dashboard_do_banco()
+        self.timer_dashboard = QTimer(self)
+        self.timer_dashboard.setInterval(int(float(os.getenv("DASHBOARD_REFRESH_SEG", "3")) * 1000))
+        self.timer_dashboard.timeout.connect(self.carregar_dashboard_do_banco)
+        self.timer_dashboard.start()
 
         # Inicializa o ouvinte global somente depois de todas as telas estarem prontas.
         self.ouvinte = OuvinteGlobal()
@@ -705,13 +729,16 @@ class InterfaceApp(QMainWindow):
             return False
 
     def abrir_dashboard(self):
+        self.carregar_dashboard_do_banco()
         self.dashboard.showMaximized(); self.dashboard.raise_(); self.dashboard.activateWindow()
 
     def carregar_dashboard_do_banco(self):
+        if self.processando:
+            return
         try:
             registros = self.dados.carregar_ultimos_estados()
             self.dashboard.carregar_do_banco(registros)
-            self.log_terminal(f"[DB] Dashboard carregado: {len(registros)} seriais unicas")
+            self.log_terminal(f"[DB] Dashboard sincronizado: {len(registros)} seriais unicas")
         except Exception as erro:
             self.log_terminal(f"[DB] Nao foi possivel carregar o dashboard: {erro}")
 
